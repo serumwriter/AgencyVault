@@ -1,0 +1,9 @@
+services:
+  - name: agencyvault
+    type: web
+    env: python
+    startCommand: ./start.sh
+    buildCommand: ""
+    plan: free
+    branch: main
+
