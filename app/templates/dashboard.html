@@ -1,0 +1,78 @@
+
+{% extends "base.html" %}
+{% block content %}
+<h1>Your Leads</h1>
+
+<section class="card">
+    <h2>Add Lead</h2>
+    <form method="post" action="/leads/add" class="form grid-2">
+        <div>
+            <label>Full name</label>
+            <input type="text" name="full_name" required>
+        </div>
+        <div>
+            <label>Phone</label>
+            <input type="text" name="phone">
+        </div>
+        <div>
+            <label>Email</label>
+            <input type="email" name="email">
+        </div>
+        <div>
+            <label>Status</label>
+            <select name="status">
+                <option>New</option>
+                <option>Contacted</option>
+                <option>Follow-up</option>
+                <option>Closed Won</option>
+                <option>Closed Lost</option>
+            </select>
+        </div>
+        <div>
+            <label>Source</label>
+            <input type="text" name="source" placeholder="TikTok, FB Ads, Referral...">
+        </div>
+        <div>
+            <label>Next follow-up</label>
+            <input type="text" name="next_followup" placeholder="Tomorrow 3pm, Next week...">
+        </div>
+        <div class="full-width">
+            <label>Notes</label>
+            <textarea name="notes" rows="3"></textarea>
+        </div>
+        <div class="full-width">
+            <button type="submit">Save lead</button>
+        </div>
+    </form>
+</section>
+
+<section class="card">
+    <h2>Lead List</h2>
+    {% if leads %}
+        <table class="leads-table">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Phone</th>
+                    <th>Status</th>
+                    <th>Source</th>
+                    <th>Next follow-up</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for lead in leads %}
+                    <tr>
+                        <td>{{ lead.full_name }}</td>
+                        <td>{{ lead.phone }}</td>
+                        <td>{{ lead.status }}</td>
+                        <td>{{ lead.source }}</td>
+                        <td>{{ lead.next_followup }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p class="muted">No leads yet. Add your first one above.</p>
+    {% endif %}
+</section>
+{% endblock %}
