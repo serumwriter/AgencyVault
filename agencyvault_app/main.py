@@ -9,10 +9,11 @@ from . import models
 from .auth import router as auth_router
 from .leads import router as leads_router
 
-# Create DB tables
-models.Base.metadata.create_all(bind=engine)
-
 app = FastAPI(title="AgencyVault")
+
+@app.on_event("startup")
+def on_startup():
+    models.Base.metadata.create_all(bind=engine)
 
 # Sessions
 app.add_middleware(
