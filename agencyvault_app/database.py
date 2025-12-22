@@ -12,3 +12,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# Create tables on startup (safe for early development)
+Base.metadata.create_all(bind=engine)
+
