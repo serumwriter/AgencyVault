@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>AgencyVault - {% block title %}{% endblock %}</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+    <div class="top-bar">
+        <div class="logo">AgencyVault</div>
+        {% if request.session.get("user_id") %}
+        <nav>
+            <a href="/dashboard">Dashboard</a>
+            <a href="/leads">Leads</a>
+            <a href="/leads/new">Add Lead</a>
+            <a href="/logout">Logout</a>
+        </nav>
+        {% endif %}
+    </div>
+    <div class="page">
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>
+

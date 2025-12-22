@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Leads{% endblock %}
+{% block content %}
+<h1>Your Leads</h1>
+<a class="button" href="/leads/new">+ Add Lead</a>
+<table class="leads-table">
+    <thead>
+        <tr>
+            <th>Name</th><th>Phone</th><th>Email</th><th>Status</th><th>Source</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for lead in leads %}
+        <tr>
+            <td>{{ lead.full_name }}</td>
+            <td>{{ lead.phone }}</td>
+            <td>{{ lead.email }}</td>
+            <td>{{ lead.status }}</td>
+            <td>{{ lead.source }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5">No leads yet.</td></tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endblock %}
+

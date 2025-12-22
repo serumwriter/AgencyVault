@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}New Lead{% endblock %}
+{% block content %}
+<h1>Add Lead</h1>
+<form method="post" action="/leads/new">
+    <label>Full name</label>
+    <input type="text" name="full_name" required />
+    <label>Phone</label>
+    <input type="text" name="phone" />
+    <label>Email</label>
+    <input type="email" name="email" />
+    <label>Status</label>
+    <input type="text" name="status" value="New" />
+    <label>Source</label>
+    <input type="text" name="source" placeholder="TikTok, Facebook, referral..." />
+    <label>Notes</label>
+    <textarea name="notes"></textarea>
+    <button type="submit">Save lead</button>
+</form>
+{% endblock %}
+

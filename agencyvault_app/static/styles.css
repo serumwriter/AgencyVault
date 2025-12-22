@@ -1,0 +1,116 @@
+body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    margin: 0;
+    background: #0f172a;
+    color: #e5e7eb;
+}
+
+a {
+    color: #38bdf8;
+    text-decoration: none;
+}
+a:hover { text-decoration: underline; }
+
+.top-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 24px;
+    background: #020617;
+    border-bottom: 1px solid #1f2937;
+}
+
+.logo {
+    font-weight: 700;
+    font-size: 1.1rem;
+}
+
+.top-bar nav a {
+    margin-left: 16px;
+    font-size: 0.95rem;
+}
+
+.page {
+    max-width: 960px;
+    margin: 32px auto;
+    padding: 0 16px;
+}
+
+h1 {
+    font-size: 1.6rem;
+    margin-bottom: 16px;
+}
+
+form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 420px;
+}
+
+label {
+    font-size: 0.9rem;
+    color: #9ca3af;
+}
+
+input, textarea {
+    background: #020617;
+    border: 1px solid #374151;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #e5e7eb;
+    font-size: 0.95rem;
+}
+
+button, .button {
+    margin-top: 12px;
+    display: inline-block;
+    padding: 8px 14px;
+    border-radius: 6px;
+    border: none;
+    background: #38bdf8;
+    color: #020617;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+}
+
+.button.secondary {
+    background: #1f2937;
+    color: #e5e7eb;
+}
+
+button:hover, .button:hover {
+    filter: brightness(1.07);
+}
+
+.error {
+    background: #7f1d1d;
+    color: #fecaca;
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-bottom: 12px;
+    font-size: 0.9rem;
+}
+
+.leads-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 16px;
+    background: #020617;
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.leads-table th,
+.leads-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #111827;
+    font-size: 0.9rem;
+}
+
+.leads-table th {
+    background: #0b1120;
+    text-align: left;
+}
+

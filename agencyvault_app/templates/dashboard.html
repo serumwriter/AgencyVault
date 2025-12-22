@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Welcome, {{ user.full_name or user.email }}</h1>
+<p>Total leads: {{ leads_count }}</p>
+<div class="actions">
+    <a class="button" href="/leads/new">Add new lead</a>
+    <a class="button secondary" href="/leads">View all leads</a>
+</div>
+{% endblock %}
+
