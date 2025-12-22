@@ -1,11 +1,33 @@
 {% extends "base.html" %}
-{% block title %}Dashboard{% endblock %}
 {% block content %}
-<h1>Welcome, {{ user.full_name or user.email }}</h1>
-<p>Total leads: {{ leads_count }}</p>
-<div class="actions">
-    <a class="button" href="/leads/new">Add new lead</a>
-    <a class="button secondary" href="/leads">View all leads</a>
-</div>
+
+<h2>Leads</h2>
+
+<form method="post" action="/leads/create">
+  <input name="name" placeholder="Name" required><br>
+  <input name="phone" placeholder="Phone" required><br>
+  <input name="email" placeholder="Email"><br>
+  <button type="submit">Add Lead</button>
+</form>
+
+<hr>
+
+<ul>
+{% for lead in leads %}
+  <li style="margin-bottom:12px;">
+    <strong>{{ lead.full_name }}</strong><br>
+    📞 {{ lead.phone }}<br>
+    ✉️ {{ lead.email }}
+
+    {% if lead.ai_summary %}
+      <div style="margin-top:6px;padding:8px;background:#111;border-left:3px solid #4CAF50;">
+        <strong>AI Notes:</strong><br>
+        {{ lead.ai_summary }}
+      </div>
+    {% endif %}
+  </li>
+{% endfor %}
+</ul>
+
 {% endblock %}
 

@@ -9,27 +9,29 @@ from . import models
 from .auth import router as auth_router
 from .leads import router as leads_router
 
-# create database tables
+# Create DB tables
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AgencyVault")
 
-# session middleware (for login sessions)
-app.add_middleware(SessionMiddleware, secret_key="change-this-secret-123")
+# Sessions
+app.add_middleware(
+    SessionMiddleware,
+    secret_key="CHANGE_THIS_SECRET_IN_PROD"
+)
 
-# static files & templates
-app.mount("/static", StaticFiles(directory="agencyvault_app/static"), name="static")
-templates = Jinja2Templates(directory="agencyvault_app/templates")
-
-# routes from other files
+# Routers
 app.include_router(auth_router)
 app.include_router(leads_router)
 
+# Static & templates
+app.mount("/static", StaticFiles(directory="agencyvault_app/static"), name="static")
+templates = Jinja2Templates(directory="agencyvault_app/templates")
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     user_id = request.session.get("user_id")
     if not user_id:
-        return RedirectResponse(url="/login", status_code=302)
-    return RedirectResponse(url="/dashboard", status_code=302)
+        return RedirectResponse("/login", status_code=302)
+    return RedirectResponse("/dashboard", status_code=302)
 
