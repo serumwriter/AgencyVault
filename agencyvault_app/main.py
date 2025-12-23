@@ -40,15 +40,18 @@ class Lead(Base):
 
     dob = Column(String(20))
     age = Column(Integer)
+
     city = Column(String(100))
+    county = Column(String(100))
     state = Column(String(10))
     zip = Column(String(20))
-    county = Column(String(100))
-    lead_type = Column(String(50))
+
+    lead_type = Column(String(50))  # FEX, Aged, Vet, etc.
 
     notes = Column(Text)
     status = Column(String(50), default="new")
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 Base.metadata.create_all(bind=engine)
