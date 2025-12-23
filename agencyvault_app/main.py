@@ -226,13 +226,18 @@ def dashboard(request: Request):
     db = SessionLocal()
     leads = db.query(Lead).order_by(Lead.id.desc()).all()
     db.close()
-
-    rows = "".join(
-    f"""
-    <div class='card'>
+rows = ""
+for l in leads:
+    rows += f"""
+    <div class="card">
       <b>{l.full_name}</b><br>
       {l.phone}<br>
-      {l.email or ''}
+      {l.email or ""}
+
+      <div style="margin-top:6px;">
+        <strong>Dial Score:</strong> {l.dial_score}<br>
+        <strong>Status:</strong> {l.dial_status}
+      </div>
 
       <form method="post" action="/leads/delete/{l.id}">
         <button style="background:#b91c1c;margin-top:8px">
@@ -241,31 +246,32 @@ def dashboard(request: Request):
       </form>
     </div>
     """
-    for l in leads
-)
+return page("Dashboard", f"""
+<div class="card">
+  <h3>Add Lead</h3>
+  <form method="post" action="/leads/create">
+    <input name="name" placeholder="Full Name" required>
+    <input name="phone" placeholder="Phone" required>
+    <input name="email" placeholder="Email">
+    <button>Add Lead</button>
+  </form>
+</div>
 
+<div class="card">
+  <h3>Bulk Upload (CSV)</h3>
+  <form method="post" action="/leads/upload" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv" required>
+    <button>Upload</button>
+  </form>
+</div>
 
-    return page("Dashboard", f"""
-    <div class="card">
-      <h3>Add Lead</h3>
-      <form method="post" action="/leads/create">
-        <input name="name" placeholder="Full Name" required>
-        <input name="phone" placeholder="Phone" required>
-        <input name="email" placeholder="Email">
-        <button>Add Lead</button>
-      </form>
-    </div>
+{% if not rows %}
+  <div class="card">No leads yet</div>
+{% endif %}
 
-    <div class="card">
-      <h3>Bulk Upload (CSV)</h3>
-      <form method="post" action="/leads/upload" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".csv" required>
-        <button>Upload</button>
-      </form>
-    </div>
+{rows}
+""")
 
-    {rows}
-    """)
 
 @app.post("/leads/create")
 def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form("")):
