@@ -218,63 +218,73 @@ def login():
     resp.set_cookie("av", "1")
     return resp
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request):
-    if not logged_in(request):
-        return RedirectResponse("/login")
-
+@app.get("/dashboard")
+def dashboard():
     db = SessionLocal()
-    leads = db.query(Lead).order_by(Lead.id.desc()).all()
+    leads = db.query(Lead).order_by(Lead.created_at.desc()).all()
     db.close()
-rows = ""
-for l in leads:
-    rows += f"""
+
+    rows = ""
+    for l in leads:
+        rows += f"""
+        <div class="card">
+          <b>{l.full_name}</b><br>
+          {l.phone}<br>
+          {l.email or ""}
+
+          <div style="margin-top:6px;">
+            <strong>Dial Score:</strong> {l.dial_score}<br>
+            <strong>Status:</strong> {l.dial_status}
+          </div>
+
+          <form method="post" action="/leads/delete/{l.id}">
+            <button style="background:#b91c1c;margin-top:8px">
+              Delete
+            </button>
+          </form>
+        </div>
+        """
+
+    if not rows:
+        rows = "<div class='card'>No leads yet</div>"
+
+    return HTMLResponse(f"""
+    <html>
+    <head>
+      <title>AgencyVault</title>
+      <style>
+        body {{ background:#0b0b0b; color:#fff; font-family:Arial; }}
+        .card {{ background:#151515; padding:16px; margin:12px 0; border-radius:8px; }}
+        input, button {{ padding:8px; margin:4px 0; }}
+        button {{ cursor:pointer; }}
+      </style>
+    </head>
+    <body>
+
     <div class="card">
-      <b>{l.full_name}</b><br>
-      {l.phone}<br>
-      {l.email or ""}
-
-      <div style="margin-top:6px;">
-        <strong>Dial Score:</strong> {l.dial_score}<br>
-        <strong>Status:</strong> {l.dial_status}
-      </div>
-
-      <form method="post" action="/leads/delete/{l.id}">
-        <button style="background:#b91c1c;margin-top:8px">
-          Delete
-        </button>
+      <h3>Add Lead</h3>
+      <form method="post" action="/leads/create">
+        <input name="name" placeholder="Full Name" required><br>
+        <input name="phone" placeholder="Phone" required><br>
+        <input name="email" placeholder="Email"><br>
+        <button>Add Lead</button>
       </form>
     </div>
-    """
-return page("Dashboard", f"""
-<div class="card">
-  <h3>Add Lead</h3>
-  <form method="post" action="/leads/create">
-    <input name="name" placeholder="Full Name" required>
-    <input name="phone" placeholder="Phone" required>
-    <input name="email" placeholder="Email">
-    <button>Add Lead</button>
-  </form>
-</div>
 
-<div class="card">
-  <h3>Bulk Upload (CSV)</h3>
-  <form method="post" action="/leads/upload" enctype="multipart/form-data">
-    <input type="file" name="file" accept=".csv" required>
-    <button>Upload</button>
-  </form>
-</div>
+    <div class="card">
+      <h3>Bulk Upload (CSV)</h3>
+      <form method="post" action="/leads/upload" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".csv" required><br>
+        <button>Upload</button>
+      </form>
+    </div>
 
-{% if not rows %}
-  <div class="card">No leads yet</div>
-{% endif %}
+    {rows}
 
-    {% if not rows %}
-  <div class="card">No leads yet</div>
-{% endif %}
+    </body>
+    </html>
+    """)
 
-{rows}
-""")
 
 
 @app.post("/leads/create")
