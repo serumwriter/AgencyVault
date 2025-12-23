@@ -313,12 +313,53 @@ def upload(file: UploadFile = File(...)):
             skipped += 1
             continue
 
-        db.add(Lead(
-            full_name=name,
-            phone=normalize_phone(phone),
-            email=email or None,
-            status="new"
-        ))
+        notes = []
+lead_type = None
+city = county = state = zip_code = None
+dob = age = None
+
+for cell in r:
+    c = cell.strip()
+    if not c:
+        continue
+
+    if looks_like_dob(c):
+        dob = c
+        notes.append(f"DOB: {c}")
+
+    elif looks_like_age(c):
+        age = int(c)
+        notes.append(f"Age: {c}")
+
+    elif looks_like_zip(c):
+        zip_code = c
+
+    elif looks_like_state(c):
+        state = c
+
+    elif looks_like_city(c):
+        city = c
+
+    elif looks_like_lead_type(c):
+        lead_type = c.upper()
+
+
+       db.add(Lead(
+    full_name=name,
+    phone=normalize_phone(phone),
+    email=email or None,
+
+    dob=dob,
+    age=age,
+    city=city,
+    state=state,
+    zip=zip_code,
+    lead_type=lead_type,
+
+    notes="; ".join(notes) if notes else None,
+    status="new"
+))
+
         imported += 1
 
     db.commit()
@@ -334,3 +375,19 @@ def upload(file: UploadFile = File(...)):
             """
         )
     )
+
+def looks_like_age(v):
+    return v.isdigit() and 18 <= int(v) <= 110
+
+def looks_like_zip(v):
+    return v.isdigit() and len(v) == 5
+
+def looks_like_state(v):
+    return v.isalpha() and len(v) == 2
+
+def looks_like_city(v):
+    return v.replace(" ", "").isalpha() and len(v) > 2
+
+def looks_like_lead_type(v):
+    v = v.lower()
+    return any(x in v for x in ["fex", "final", "aged", "vet", "veteran"])
