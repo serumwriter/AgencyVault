@@ -24,7 +24,11 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 # SQLAlchemy SYNC engine (stable, simple)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL.replace("postgresql://", "postgresql+psycopg://"),
+    pool_pre_ping=True
+)
+
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
 
