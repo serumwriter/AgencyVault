@@ -48,9 +48,14 @@ class Lead(Base):
 
     lead_type = Column(String(50))  # FEX, Aged, Vet, etc.
 
+    # 🔹 ADD THESE TWO LINES
+    dial_score = Column(Integer, default=0)
+    dial_status = Column(String(20), default="HOLD")
+
     notes = Column(Text)
     status = Column(String(50), default="new")
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 
