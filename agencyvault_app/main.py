@@ -220,9 +220,22 @@ def dashboard(request: Request):
     db.close()
 
     rows = "".join(
-        f"<div class='card'><b>{l.full_name}</b><br>{l.phone}<br>{l.email or ''}</div>"
-        for l in leads
-    )
+    f"""
+    <div class='card'>
+      <b>{l.full_name}</b><br>
+      {l.phone}<br>
+      {l.email or ''}
+
+      <form method="post" action="/leads/delete/{l.id}">
+        <button style="background:#b91c1c;margin-top:8px">
+          Delete
+        </button>
+      </form>
+    </div>
+    """
+    for l in leads
+)
+
 
     return page("Dashboard", f"""
     <div class="card">
@@ -257,6 +270,17 @@ def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form
     db.commit()
     db.close()
     return RedirectResponse("/dashboard", status_code=302)
+
+@app.post("/leads/delete/{lead_id}")
+def delete_lead(lead_id: int):
+    db = SessionLocal()
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+    if lead:
+        db.delete(lead)
+        db.commit()
+    db.close()
+    return RedirectResponse("/dashboard", status_code=302)
+
 
 @app.post("/leads/upload")
 def upload(file: UploadFile = File(...)):
