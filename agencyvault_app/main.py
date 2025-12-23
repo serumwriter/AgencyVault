@@ -36,3 +36,31 @@ async def root(request: Request):
         return RedirectResponse("/login", status_code=302)
     return RedirectResponse("/dashboard", status_code=302)
 
+from sqlalchemy import text
+from fastapi.responses import HTMLResponse
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    user_id = request.session.get("user_id")
+    if not user_id:
+        return RedirectResponse("/login", status_code=302)
+
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text("SELECT id, first_name, last_name, phone, email FROM leads ORDER BY id DESC")
+        )
+        rows = result.fetchall()
+
+    leads = []
+    for r in rows:
+        leads.append({
+            "full_name": f"{r.first_name or ''} {r.last_name or ''}".strip(),
+            "phone": r.phone,
+            "email": r.email
+        })
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "leads": leads}
+    )
+
