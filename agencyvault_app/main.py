@@ -58,7 +58,7 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 # -----------------------------
 # HELPERS
 # -----------------------------
-    def _digits(s: str) -> str:
+def _digits(s: str) -> str:
     return re.sub(r"\D", "", (s or ""))
 
 def looks_like_email(s: str) -> bool:
@@ -129,7 +129,7 @@ def infer_csv_mapping(rows: list[list[str]], sample_limit: int = 50) -> dict:
     max_cols = max(len(r) for r in sample)
     sample = [r + [""] * (max_cols - len(r)) for r in sample]
 
-    def score_col(pred):
+def score_col(pred):
         scores = []
         for c in range(max_cols):
             hits = 0
@@ -152,7 +152,7 @@ def infer_csv_mapping(rows: list[list[str]], sample_limit: int = 50) -> dict:
     name_scores = score_col(looks_like_name)
     addr_scores = score_col(looks_like_address)
 
-    def best(scores, min_score=0.35):
+def best(scores, min_score=0.35):
         best_i = max(range(len(scores)), key=lambda i: scores[i])
         return best_i if scores[best_i] >= min_score else None
 
