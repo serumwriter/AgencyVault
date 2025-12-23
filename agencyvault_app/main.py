@@ -251,36 +251,49 @@ def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form
 @app.post("/leads/upload")
 def upload(file: UploadFile = File(...)):
     raw = file.file.read().decode("utf-8", errors="ignore").splitlines()
-    rows = list(csv.reader(raw))
+    rows = [r for r in csv.reader(raw) if any(c.strip() for c in r)]
+
+    if not rows:
+        return HTMLResponse(page("Upload Error", "<p>Empty file</p><a href='/dashboard'>Back</a>"))
+
     mapping = infer_mapping(rows)
 
     db = SessionLocal()
-    added = 0
+    imported = 0
+    skipped = 0
 
     for r in rows:
-        try:
-            name = r[mapping["name"]].strip() if mapping.get("name") is not None and mapping["name"] < len(r) else ""
+        name = r[mapping["name"]].strip() if mapping.get("name") is not None and mapping["name"] < len(r) else ""
+        phone = r[mapping["phone"]].strip() if mapping.get("phone") is not None and mapping["phone"] < len(r) else ""
+        email = r[mapping["email"]].strip() if mapping.get("email") is not None and mapping["email"] < len(r) else ""
 
-# HARD SAFETY: only accept real human names
-if not looks_like_name(name):
-    continue
-
-            phone = r[mapping["phone"]]
-            email = r[mapping["email"]] if mapping["email"] is not None else ""
-        except Exception:
+        # ABSOLUTE RULE: do not guess
+        if not looks_like_name(name):
+            skipped += 1
             continue
 
-        if not name or not phone:
+        if not looks_like_phone(phone):
+            skipped += 1
             continue
 
         db.add(Lead(
-            full_name=name.strip(),
+            full_name=name,
             phone=normalize_phone(phone),
-            email=email.strip() or None
+            email=email or None,
+            status="new"
         ))
-        added += 1
+        imported += 1
 
     db.commit()
     db.close()
 
-    return HTMLResponse(page("Upload Complete", f"<h3>Imported {added}</h3><a href='/dashboard'>Back</a>"))
+    return HTMLResponse(
+        page(
+            "Upload Complete",
+            f"""
+            <h3>Imported: {imported}</h3>
+            <p>Skipped (non-human / low confidence): {skipped}</p>
+            <a href="/dashboard">Back</a>
+            """
+        )
+    )
