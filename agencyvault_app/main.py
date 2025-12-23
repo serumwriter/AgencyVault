@@ -203,6 +203,15 @@ def dashboard(request: Request):
 
       <div class="card">
         <h3>Add Lead</h3>
+        <div class="card">
+  <h3>Bulk Upload (CSV)</h3>
+  <form method="post" action="/leads/upload" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv" required>
+    <div style="height:10px"></div>
+    <button type="submit">Upload CSV</button>
+  </form>
+  <p class="muted">CSV must include columns like: name, phone, email</p>
+</div>
         <form method="post" action="/leads/create">
           <div class="row">
             <input name="name" placeholder="Full Name" required>
@@ -279,3 +288,67 @@ def lead_create_api(
         return {"success": True, "id": l.id}
     finally:
         db.close()
+import csv
+from fastapi import UploadFile, File
+
+@app.post("/leads/upload")
+def upload_leads_csv(request: Request, file: UploadFile = File(...)):
+    if not cookie_logged_in(request):
+        return RedirectResponse("/login", status_code=302)
+
+    if not file.filename.lower().endswith(".csv"):
+        return HTMLResponse(
+            page("Upload Error", "<p>Only CSV files are supported.</p><a href='/dashboard'>Back</a>"),
+            status_code=400,
+        )
+
+    db = SessionLocal()
+    imported = 0
+    skipped = 0
+
+    try:
+        contents = file.file.read().decode("utf-8", errors="ignore").splitlines()
+        reader = csv.DictReader(contents)
+
+        for row in reader:
+            name = (row.get("name") or row.get("full_name") or "").strip()
+            phone = (row.get("phone") or "").strip()
+            email = (row.get("email") or "").strip()
+
+            if not name or not phone:
+                skipped += 1
+                continue
+
+            phone_norm = normalize_phone(phone)
+
+            # Deduplicate by phone
+            existing = db.query(Lead).filter(Lead.phone == phone_norm).first()
+            if existing:
+                skipped += 1
+                continue
+
+            lead = Lead(
+                full_name=name,
+                phone=phone_norm,
+                email=email or None,
+                status="new",
+            )
+            db.add(lead)
+            imported += 1
+
+        db.commit()
+
+    finally:
+        db.close()
+
+    return HTMLResponse(
+        page(
+            "Upload Complete",
+            f"""
+            <h2>Upload Complete</h2>
+            <p>Imported: {imported}</p>
+            <p>Skipped: {skipped}</p>
+            <a href="/dashboard">Back to dashboard</a>
+            """,
+        )
+    )
