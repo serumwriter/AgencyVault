@@ -291,7 +291,9 @@ def upload(file: UploadFile = File(...)):
     rows = [r for r in csv.reader(raw) if any(c.strip() for c in r)]
 
     if not rows:
-        return HTMLResponse(page("Upload Error", "<p>Empty file</p><a href='/dashboard'>Back</a>"))
+        return HTMLResponse(
+            page("Upload Error", "<p>Empty file</p><a href='/dashboard'>Back</a>")
+        )
 
     mapping = infer_mapping(rows)
 
@@ -300,11 +302,22 @@ def upload(file: UploadFile = File(...)):
     skipped = 0
 
     for r in rows:
-        name = r[mapping["name"]].strip() if mapping.get("name") is not None and mapping["name"] < len(r) else ""
-        phone = r[mapping["phone"]].strip() if mapping.get("phone") is not None and mapping["phone"] < len(r) else ""
-        email = r[mapping["email"]].strip() if mapping.get("email") is not None and mapping["email"] < len(r) else ""
+        name = (
+            r[mapping["name"]].strip()
+            if mapping.get("name") is not None and mapping["name"] < len(r)
+            else ""
+        )
+        phone = (
+            r[mapping["phone"]].strip()
+            if mapping.get("phone") is not None and mapping["phone"] < len(r)
+            else ""
+        )
+        email = (
+            r[mapping["email"]].strip()
+            if mapping.get("email") is not None and mapping["email"] < len(r)
+            else ""
+        )
 
-        # ABSOLUTE RULE: do not guess
         if not looks_like_name(name):
             skipped += 1
             continue
@@ -313,53 +326,49 @@ def upload(file: UploadFile = File(...)):
             skipped += 1
             continue
 
+        dob = None
+        age = None
+        city = None
+        state = None
+        zip_code = None
+        lead_type = None
         notes = []
-lead_type = None
-city = county = state = zip_code = None
-dob = age = None
 
-for cell in r:
-    c = cell.strip()
-    if not c:
-        continue
+        for cell in r:
+            c = cell.strip()
+            if not c:
+                continue
 
-    if looks_like_dob(c):
-        dob = c
-        notes.append(f"DOB: {c}")
+            if looks_like_dob(c):
+                dob = c
+                notes.append(f"DOB: {c}")
+            elif looks_like_age(c):
+                age = int(c)
+                notes.append(f"Age: {c}")
+            elif looks_like_zip(c):
+                zip_code = c
+            elif looks_like_state(c):
+                state = c.upper()
+            elif looks_like_city(c):
+                city = c
+            elif looks_like_lead_type(c):
+                lead_type = c.upper()
 
-    elif looks_like_age(c):
-        age = int(c)
-        notes.append(f"Age: {c}")
-
-    elif looks_like_zip(c):
-        zip_code = c
-
-    elif looks_like_state(c):
-        state = c
-
-    elif looks_like_city(c):
-        city = c
-
-    elif looks_like_lead_type(c):
-        lead_type = c.upper()
-
-
-       db.add(Lead(
-    full_name=name,
-    phone=normalize_phone(phone),
-    email=email or None,
-
-    dob=dob,
-    age=age,
-    city=city,
-    state=state,
-    zip=zip_code,
-    lead_type=lead_type,
-
-    notes="; ".join(notes) if notes else None,
-    status="new"
-))
-
+        db.add(
+            Lead(
+                full_name=name,
+                phone=normalize_phone(phone),
+                email=email or None,
+                dob=dob,
+                age=age,
+                city=city,
+                state=state,
+                zip=zip_code,
+                lead_type=lead_type,
+                notes="; ".join(notes) if notes else None,
+                status="new",
+            )
+        )
         imported += 1
 
     db.commit()
@@ -370,11 +379,12 @@ for cell in r:
             "Upload Complete",
             f"""
             <h3>Imported: {imported}</h3>
-            <p>Skipped (non-human / low confidence): {skipped}</p>
+            <p>Skipped: {skipped}</p>
             <a href="/dashboard">Back</a>
-            """
+            """,
         )
     )
+
 
 def looks_like_age(v):
     return v.isdigit() and 18 <= int(v) <= 110
