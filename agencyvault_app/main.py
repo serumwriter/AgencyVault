@@ -71,8 +71,48 @@ def looks_like_email(s):
     return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s or ""))
 
 def looks_like_name(s):
-    s = s or ""
-    return len(s.split()) >= 2 and not any(c.isdigit() for c in s)
+    if not s:
+        return False
+
+    s = s.strip()
+
+    # words that indicate lead categories, NOT human names
+    banned = [
+        # generic lead labels
+        "lead", "aged", "internet",
+
+        # tiering
+        "gold", "silver", "bronze",
+
+        # final expense (all common forms)
+        "final", "expense", "finalexpense", "final-expense",
+        "fex", "f.e.x", "fe",
+
+        # insurance products
+        "iul", "term", "whole", "life",
+
+        # niches
+        "vet", "veteran", "mortgage",
+
+        # traffic sources
+        "facebook", "fb", "tiktok", "tt"
+    ]
+
+    s_lower = s.lower()
+    if any(b in s_lower for b in banned):
+        return False
+
+    parts = s.split()
+    if not (2 <= len(parts) <= 4):
+        return False
+
+    for p in parts:
+        if not p.isalpha():
+            return False
+        if not p[0].isupper():
+            return False
+
+    return True
 
 def infer_mapping(rows):
     cols = max(len(r) for r in rows)
