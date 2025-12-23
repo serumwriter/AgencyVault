@@ -269,6 +269,10 @@ return page("Dashboard", f"""
   <div class="card">No leads yet</div>
 {% endif %}
 
+    {% if not rows %}
+  <div class="card">No leads yet</div>
+{% endif %}
+
 {rows}
 """)
 
