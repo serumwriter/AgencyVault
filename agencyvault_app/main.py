@@ -75,42 +75,47 @@ def looks_like_name(s):
         return False
 
     s = s.strip()
+    s_lower = s.lower()
 
-    # words that indicate lead categories, NOT human names
+    # Hard reject: lead categories, products, sources
     banned = [
-        # generic lead labels
         "lead", "aged", "internet",
-
-        # tiering
         "gold", "silver", "bronze",
-
-        # final expense (all common forms)
-        "final", "expense", "finalexpense", "final-expense",
-        "fex", "f.e.x", "fe",
-
-        # insurance products
+        "final", "expense", "finalexpense", "fex", "f.e.x",
         "iul", "term", "whole", "life",
-
-        # niches
         "vet", "veteran", "mortgage",
-
-        # traffic sources
         "facebook", "fb", "tiktok", "tt"
     ]
 
-    s_lower = s.lower()
     if any(b in s_lower for b in banned):
         return False
 
     parts = s.split()
+
+    # Human names are usually 2–4 words
     if not (2 <= len(parts) <= 4):
         return False
 
+    # Reject if any word is all-caps (common for counties/cities)
+    if any(p.isupper() for p in parts):
+        return False
+
+    # Reject if it contains location words
+    location_words = [
+        "county", "city", "town", "township",
+        "parish", "borough", "district"
+    ]
+    if any(w in s_lower for w in location_words):
+        return False
+
+    # Each word must look like a proper name
     for p in parts:
         if not p.isalpha():
             return False
         if not p[0].isupper():
             return False
+
+    return True
 
     return True
 
@@ -250,7 +255,12 @@ def upload(file: UploadFile = File(...)):
 
     for r in rows:
         try:
-            name = r[mapping["name"]]
+            name = r[mapping["name"]].strip() if mapping.get("name") is not None and mapping["name"] < len(r) else ""
+
+# HARD SAFETY: only accept real human names
+if not looks_like_name(name):
+    continue
+
             phone = r[mapping["phone"]]
             email = r[mapping["email"]] if mapping["email"] is not None else ""
         except Exception:
