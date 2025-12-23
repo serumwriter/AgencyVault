@@ -121,7 +121,11 @@ def looks_like_name(s):
 
 def infer_mapping(rows):
     cols = max(len(r) for r in rows)
-    scores = {"name": [0]*cols, "phone": [0]*cols, "email": [0]*cols}
+    scores = {
+        "name": [0] * cols,
+        "phone": [0] * cols,
+        "email": [0] * cols,
+    }
 
     for r in rows[:50]:
         for i in range(cols):
@@ -135,9 +139,9 @@ def infer_mapping(rows):
             if looks_like_name(v):
                 scores["name"][i] += 1
 
-    def best(key):
+    def best(key, min_score=1):
         i = max(range(cols), key=lambda x: scores[key][x])
-        return i if scores[key][i] > 0 else None
+        return i if scores[key][i] >= min_score else None
 
     return {
         "name": best("name"),
