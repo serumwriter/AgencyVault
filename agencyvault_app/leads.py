@@ -1,49 +1,34 @@
-from fastapi import APIRouter, Request, Depends, Form
-from fastapi.responses import RedirectResponse, HTMLResponse
-from sqlalchemy.orm import Session
-from fastapi.templating import Jinja2Templates
-
-from .database import SessionLocal
-from .models import Lead
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import text
+from agencyvault_app.database import engine
 
 router = APIRouter()
-templates = Jinja2Templates(directory="agencyvault_app/templates")
 
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-@router.get("/dashboard", response_class=HTMLResponse)
-def dashboard(request: Request, db: Session = Depends(get_db)):
-    leads = db.query(Lead).all()
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {"request": request, "leads": leads}
-    )
-
+class LeadCreate(BaseModel):
+    first_name: str
+    last_name: str
+    phone: str
 
 @router.post("/leads")
-def create_lead(
-    name: str = Form(...),
-    phone: str = Form(...),
-    email: str = Form(...),
-    notes: str = Form(None),
-    db: Session = Depends(get_db)
-):
-    lead = Lead(
-        name=name,
-        phone=phone,
-        email=email,
-        notes=notes
-    )
+async def create_lead(lead: LeadCreate):
+    try:
+        async with engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                    INSERT INTO leads (first_name, last_name, phone, status)
+                    VALUES (:first_name, :last_name, :phone, 'new')
+                    RETURNING id
+                """),
+                {
+                    "first_name": lead.first_name,
+                    "last_name": lead.last_name,
+                    "phone": lead.phone,
+                }
+            )
+            lead_id = result.scalar()
 
-    db.add(lead)
-    db.commit()
+        return {"id": str(lead_id), "status": "saved"}
 
-    return RedirectResponse("/dashboard", status_code=303)
-
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
