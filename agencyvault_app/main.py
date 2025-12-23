@@ -37,9 +37,19 @@ class Lead(Base):
     full_name = Column(String(255), nullable=False)
     phone = Column(String(50), nullable=False, index=True)
     email = Column(String(255))
+
+    dob = Column(String(20))
+    age = Column(Integer)
+    city = Column(String(100))
+    state = Column(String(10))
+    zip = Column(String(20))
+    county = Column(String(100))
+    lead_type = Column(String(50))
+
     notes = Column(Text)
     status = Column(String(50), default="new")
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 Base.metadata.create_all(bind=engine)
 
