@@ -58,6 +58,121 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 # -----------------------------
 # HELPERS
 # -----------------------------
+    def _digits(s: str) -> str:
+    return re.sub(r"\D", "", (s or ""))
+
+def looks_like_email(s: str) -> bool:
+    s = (s or "").strip().lower()
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
+
+def looks_like_phone(s: str) -> bool:
+    d = _digits(s)
+    if len(d) == 10:
+        return True
+    if len(d) == 11 and d.startswith("1"):
+        return True
+    if 10 <= len(d) <= 15 and (s or "").strip().startswith("+"):
+        return True
+    return False
+
+def looks_like_zip(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.match(r"^\d{5}(-\d{4})?$", s))
+
+def looks_like_state(s: str) -> bool:
+    s = (s or "").strip().upper()
+    return bool(re.match(r"^[A-Z]{2}$", s))
+
+def looks_like_dob(s: str) -> bool:
+    s = (s or "").strip()
+    # common DOB formats
+    return bool(
+        re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", s) or
+        re.match(r"^\d{4}-\d{2}-\d{2}$", s) or
+        re.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$", s)
+    )
+
+def looks_like_name(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) < 3 or len(s) > 60:
+        return False
+    if any(ch.isdigit() for ch in s):
+        return False
+    # at least two words, mostly letters/spaces
+    words = [w for w in re.split(r"\s+", s) if w]
+    if len(words) < 2:
+        return False
+    letters = sum(c.isalpha() for c in s)
+    return letters >= max(3, int(0.6 * len(s)))
+
+def looks_like_address(s: str) -> bool:
+    s = (s or "").strip()
+    if len(s) < 6:
+        return False
+    # number + street-ish
+    if not re.search(r"\d", s):
+        return False
+    street_words = ["st", "street", "ave", "avenue", "rd", "road", "blvd", "lane", "ln", "dr", "drive", "ct", "court", "way", "hwy", "highway"]
+    s_l = s.lower()
+    return any(w in s_l for w in street_words)
+
+def infer_csv_mapping(rows: list[list[str]], sample_limit: int = 50) -> dict:
+    """
+    Infer which column is name/phone/email/dob/address/state/zip WITHOUT using headers.
+    Returns mapping: {"name": idx, "phone": idx, "email": idx, ...}
+    """
+    if not rows:
+        return {}
+
+    sample = rows[: min(len(rows), sample_limit)]
+    # pad rows to same length
+    max_cols = max(len(r) for r in sample)
+    sample = [r + [""] * (max_cols - len(r)) for r in sample]
+
+    def score_col(pred):
+        scores = []
+        for c in range(max_cols):
+            hits = 0
+            total = 0
+            for r in sample:
+                v = (r[c] or "").strip()
+                if not v:
+                    continue
+                total += 1
+                if pred(v):
+                    hits += 1
+            scores.append((hits / total) if total else 0.0)
+        return scores
+
+    phone_scores = score_col(looks_like_phone)
+    email_scores = score_col(looks_like_email)
+    dob_scores = score_col(looks_like_dob)
+    zip_scores = score_col(looks_like_zip)
+    state_scores = score_col(looks_like_state)
+    name_scores = score_col(looks_like_name)
+    addr_scores = score_col(looks_like_address)
+
+    def best(scores, min_score=0.35):
+        best_i = max(range(len(scores)), key=lambda i: scores[i])
+        return best_i if scores[best_i] >= min_score else None
+
+    mapping = {}
+    mapping["phone"] = best(phone_scores, 0.40)
+    mapping["email"] = best(email_scores, 0.35)
+    mapping["dob"] = best(dob_scores, 0.35)
+    mapping["zip"] = best(zip_scores, 0.35)
+    mapping["state"] = best(state_scores, 0.40)
+    mapping["address"] = best(addr_scores, 0.35)
+
+    # For name, require it’s not the same as phone/email
+    name_idx = best(name_scores, 0.35)
+    if name_idx is not None and name_idx not in {mapping.get("phone"), mapping.get("email")}:
+        mapping["name"] = name_idx
+    else:
+        mapping["name"] = None
+
+    return mapping
+
 def normalize_phone(raw: str) -> str:
     """Basic normalization. Keep it simple; improve later."""
     raw = (raw or "").strip()
@@ -297,47 +412,79 @@ def upload_leads_csv(request: Request, file: UploadFile = File(...)):
         return RedirectResponse("/login", status_code=302)
 
     if not file.filename.lower().endswith(".csv"):
-        return HTMLResponse(
-            page("Upload Error", "<p>Only CSV files are supported.</p><a href='/dashboard'>Back</a>"),
-            status_code=400,
-        )
+        return HTMLResponse(page("Upload Error", "<p>Only CSV files are supported.</p><a href='/dashboard'>Back</a>"), status_code=400)
 
-    db = SessionLocal()
+    raw = file.file.read().decode("utf-8", errors="ignore").splitlines()
+    reader = csv.reader(raw)
+
+    rows = [r for r in reader if any((c or "").strip() for c in r)]
+    if not rows:
+        return HTMLResponse(page("Upload Error", "<p>CSV appears empty.</p><a href='/dashboard'>Back</a>"), status_code=400)
+
+    # If first row looks like headers, drop it (but we do NOT rely on it)
+    first = [c.strip().lower() for c in rows[0]]
+    headerish = any("phone" in c or "name" in c or "email" in c for c in first)
+    data_rows = rows[1:] if headerish else rows
+
+    mapping = infer_csv_mapping(data_rows)
+
     imported = 0
     skipped = 0
+    review = 0
+    dupes = 0
 
+    db = SessionLocal()
     try:
-        contents = file.file.read().decode("utf-8", errors="ignore").splitlines()
-        reader = csv.DictReader(contents)
+        for r in data_rows:
+            # pad row
+            r = r + [""] * (max(0, max(len(r), 1) - len(r)))
 
-        for row in reader:
-            name = (row.get("name") or row.get("full_name") or "").strip()
-            phone = (row.get("phone") or "").strip()
-            email = (row.get("email") or "").strip()
+            name = (r[mapping["name"]].strip() if mapping.get("name") is not None and mapping["name"] < len(r) else "")
+            phone_raw = (r[mapping["phone"]].strip() if mapping.get("phone") is not None and mapping["phone"] < len(r) else "")
+            email = (r[mapping["email"]].strip() if mapping.get("email") is not None and mapping["email"] < len(r) else "")
 
-            if not name or not phone:
+            # If we didn't confidently infer name/phone, try fallback scanning the row
+            if not phone_raw:
+                for cell in r:
+                    if looks_like_phone(cell):
+                        phone_raw = cell.strip()
+                        break
+
+            if not name:
+                # find best name-like cell
+                candidates = [c.strip() for c in r if looks_like_name(c)]
+                if candidates:
+                    name = candidates[0]
+
+            if not phone_raw or not name:
+                review += 1
                 skipped += 1
                 continue
 
-            phone_norm = normalize_phone(phone)
+            phone_norm = normalize_phone(phone_raw)
 
             # Deduplicate by phone
-            existing = db.query(Lead).filter(Lead.phone == phone_norm).first()
-            if existing:
-                skipped += 1
+            if db.query(Lead).filter(Lead.phone == phone_norm).first():
+                dupes += 1
                 continue
 
-            lead = Lead(
-                full_name=name,
-                phone=phone_norm,
-                email=email or None,
-                status="new",
-            )
-            db.add(lead)
+            # Put extra fields into notes (address/dob/state/zip if we can infer)
+            extras = {}
+            for key in ["dob", "address", "state", "zip"]:
+                idx = mapping.get(key)
+                if idx is not None and idx < len(r):
+                    val = r[idx].strip()
+                    if val:
+                        extras[key] = val
+
+            notes = ""
+            if extras:
+                notes = "Imported extras: " + ", ".join([f"{k}={v}" for k, v in extras.items()])
+
+            db.add(Lead(full_name=name, phone=phone_norm, email=(email or None), status="new", notes=(notes or None)))
             imported += 1
 
         db.commit()
-
     finally:
         db.close()
 
@@ -347,8 +494,11 @@ def upload_leads_csv(request: Request, file: UploadFile = File(...)):
             f"""
             <h2>Upload Complete</h2>
             <p>Imported: {imported}</p>
+            <p>Duplicates ignored: {dupes}</p>
             <p>Skipped: {skipped}</p>
+            <p class="muted">Auto-detected columns: {mapping}</p>
             <a href="/dashboard">Back to dashboard</a>
             """,
         )
     )
+
