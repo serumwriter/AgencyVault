@@ -475,3 +475,58 @@ def start_dialing():
     db.close()
 
     return RedirectResponse("/dashboard", status_code=302)
+
+from fastapi import Response
+import os
+from app.twilio_client import (
+    get_twilio_client,
+    get_from_number,
+    allow_test_calls,
+    get_test_to_number,
+)
+
+@app.get("/twiml/sarah-test")
+def twiml_sarah_test():
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">
+    Hi, this is Sarah with AgencyVault. This is a test call to confirm dialing is working.
+  </Say>
+  <Pause length="1"/>
+  <Say voice="Polly.Joanna">
+    If you can hear this, Twilio integration is live. Goodbye.
+  </Say>
+</Response>
+"""
+    return Response(content=xml, media_type="application/xml")
+
+
+@app.post("/dial/test")
+def dial_test_call():
+    if not allow_test_calls():
+        return {
+            "ok": False,
+            "error": "Test calls disabled. Set TWILIO_ALLOW_TEST_CALLS=true."
+        }
+
+    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip()
+    if not base_url:
+        return {
+            "ok": False,
+            "error": "PUBLIC_BASE_URL missing."
+        }
+
+    client = get_twilio_client()
+
+    call = client.calls.create(
+        to=get_test_to_number(),
+        from_=get_from_number(),
+        url=base_url.rstrip("/") + "/twiml/sarah-test",
+        method="GET",
+    )
+
+    return {
+        "ok": True,
+        "call_sid": call.sid,
+        "status": call.status,
+    }
