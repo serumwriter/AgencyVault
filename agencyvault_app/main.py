@@ -262,6 +262,12 @@ def dashboard():
     <body>
 
     <div class="card">
+      <div class="card">
+  <form method="post" action="/dial/start">
+    <button style="background:#2563eb;">Start Dialing</button>
+  </form>
+</div>
+
       <h3>Add Lead</h3>
       <form method="post" action="/leads/create">
         <input name="name" placeholder="Full Name" required><br>
@@ -284,6 +290,28 @@ def dashboard():
     </body>
     </html>
     """)
+
+@app.post("/dial/start")
+def start_dialing():
+    db = SessionLocal()
+
+    leads = (
+        db.query(Lead)
+        .filter(Lead.dial_status == "READY")
+        .order_by(Lead.dial_score.desc())
+        {f"<div style='margin-top:6px;color:#22c55e;'>Queued: #{l.dial_queue_position}</div>" if l.dial_queue_position else ""}
+        .limit(10)
+        .all()
+    )
+
+    for i, lead in enumerate(leads, start=1):
+        lead.dial_queue_position = i
+
+    db.commit()
+    db.close()
+
+    return RedirectResponse("/dashboard", status_code=302)
+
 
 
 
