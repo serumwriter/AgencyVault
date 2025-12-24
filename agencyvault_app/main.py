@@ -299,7 +299,6 @@ def start_dialing():
         db.query(Lead)
         .filter(Lead.dial_status == "READY")
         .order_by(Lead.dial_score.desc())
-        {f"<div style='margin-top:6px;color:#22c55e;'>Queued: #{l.dial_queue_position}</div>" if l.dial_queue_position else ""}
         .limit(10)
         .all()
     )
