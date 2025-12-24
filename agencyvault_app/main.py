@@ -454,3 +454,25 @@ def looks_like_city(v):
 def looks_like_lead_type(v):
     v = v.lower()
     return any(x in v for x in ["fex", "final", "aged", "vet", "veteran"])
+
+from fastapi.responses import RedirectResponse
+
+@app.post("/dial/start")
+def start_dialing():
+    db = SessionLocal()
+
+    leads = (
+        db.query(Lead)
+        .filter(Lead.dial_status == "READY")
+        .order_by(Lead.dial_score.desc())
+        .limit(10)
+        .all()
+    )
+
+    for i, lead in enumerate(leads, start=1):
+        lead.dial_queue_position = i
+
+    db.commit()
+    db.close()
+
+    return RedirectResponse("/dashboard", status_code=302)
