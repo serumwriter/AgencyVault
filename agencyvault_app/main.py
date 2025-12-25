@@ -486,14 +486,7 @@ def start_dialing():
 
     return RedirectResponse("/dashboard", status_code=302)
 
-from fastapi import Response
-import os
-from .twilio_client import (
-    get_twilio_client,
-    get_from_number,
-    allow_test_calls,
-    get_test_to_number,
-)
+
 
 
 
