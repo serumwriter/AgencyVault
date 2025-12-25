@@ -7,7 +7,7 @@ from datetime import datetime
 from fastapi import FastAPI, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
-from agencyvault_app.elevenlabs_voice import synthesize_wav
+from elevenlabs_voice import synthesize_wav
 from fastapi import Response
 import os
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
