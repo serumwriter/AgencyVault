@@ -5,5 +5,9 @@ set -o pipefail
 
 export PYTHONPATH=/opt/render/project/src
 
-exec uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"
+exec uvicorn main:app \
+  --app-dir /opt/render/project/src \
+  --host 0.0.0.0 \
+  --port "${PORT:-8000}"
+
 
