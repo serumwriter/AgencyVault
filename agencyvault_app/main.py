@@ -7,7 +7,9 @@ from datetime import datetime
 from fastapi import FastAPI, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from starlette.middleware.sessions import SessionMiddleware
-
+from agencyvault_app.elevenlabs_voice import synthesize_wav
+from fastapi import Response
+import os
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -492,18 +494,15 @@ def start_dialing():
 
 @app.get("/twiml/sarah-test")
 def twiml_sarah_test():
-    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">
-    Hi, this is Sarah with AgencyVault. This is a test call to confirm dialing is working.
-  </Say>
-  <Pause length="1"/>
-  <Say voice="Polly.Joanna">
-    If you can hear this, Twilio integration is live. Goodbye.
-  </Say>
+  <Play>{base_url}/audio/sarah-test.wav</Play>
+  <Hangup/>
 </Response>
 """
     return Response(content=xml, media_type="application/xml")
+
 
 
 @app.post("/dial/test")
@@ -513,6 +512,16 @@ def dial_test_call():
             "ok": False,
             "error": "Test calls disabled. Set TWILIO_ALLOW_TEST_CALLS=true."
         }
+
+@app.get("/audio/sarah-test.wav")
+def audio_sarah_test():
+    script = (
+        "Hi, this is Sarah with Family First Life. "
+        "I’m following up on a request for life insurance information. "
+        "This will only take a moment — is now an okay time?"
+    )
+    wav = synthesize_wav(script)
+    return Response(content=wav, media_type="audio/wav")
 
     base_url = os.environ.get("PUBLIC_BASE_URL", "").strip()
     if not base_url:
