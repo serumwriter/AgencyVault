@@ -3,6 +3,7 @@ import os
 import re
 import csv
 from datetime import datetime
+from .ai_brain import decide_next_action
 
 from fastapi import FastAPI, Request, Form, UploadFile, File, Response
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
@@ -543,4 +544,28 @@ def audio_sarah_test():
         "ok": True,
         "call_sid": call.sid,
         "status": call.status,
+    }
+@app.get("/ai/decide/{lead_id}")
+def ai_decide_lead(lead_id: int):
+    db = SessionLocal()
+
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+    if not lead:
+        db.close()
+        return {"ok": False, "error": "Lead not found"}
+
+    decision = decide_next_action(lead)
+
+    db.close()
+
+    return {
+        "ok": True,
+        "lead_id": lead_id,
+        "decision": decision["decision"],
+        "reason": decision["reason"],
+        "cooldown_until": (
+            decision["cooldown_until"].isoformat()
+            if decision["cooldown_until"]
+            else None
+        ),
     }
