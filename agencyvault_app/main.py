@@ -206,9 +206,20 @@ def simple_ai_decide(lead):
 
     return "call_now"
 
+from .ai_employee import run_ai_engine
+
 # -------------------------------------------------
 # ROUTES
 # -------------------------------------------------
+
+@app.post("/ai/run")
+def run_ai():
+    db = SessionLocal()
+    run_ai_engine(db, Lead)
+    db.commit()
+    db.close()
+    return {"ok": True}
+
 
 @app.get("/health")
 def health():
