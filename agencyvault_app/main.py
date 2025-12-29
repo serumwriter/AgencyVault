@@ -45,29 +45,23 @@ class Lead(Base):
     __tablename__ = "leads"
 
     id = Column(Integer, primary_key=True)
-    full_name = Column(String(255), nullable=False)
-    phone = Column(String(50), nullable=False, index=True)
+
+    full_name = Column(String(255))
+    phone = Column(String(50), index=True)
     email = Column(String(255))
 
-    dob = Column(String(20))
-    age = Column(Integer)
+    state = Column(String(30), default="NEW")  # AI state machine
+    ai_priority = Column(Integer, default=0)   # 0–100
+    ai_next_action = Column(String(50))         # CALL, BOOK, WAIT
+    ai_reason = Column(Text)
 
-    city = Column(String(100))
-    county = Column(String(100))
-    state = Column(String(10))
-    zip = Column(String(20))
+    ai_last_action_at = Column(DateTime)
+    ai_next_action_at = Column(DateTime)
 
-    lead_type = Column(String(50))
+    appointment_at = Column(DateTime)
 
-    dial_score = Column(Integer, default=0)
-    dial_status = Column(String(20), default="HOLD")
-
-    # ✅ AI decision (safe, no external deps)
-    ai_decision = Column(String(50), default="unprocessed")
-
-    notes = Column(Text)
-    status = Column(String(50), default="new")
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 
