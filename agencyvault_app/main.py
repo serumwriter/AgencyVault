@@ -494,6 +494,32 @@ def upload(file: UploadFile = File(...)):
     )
 
 
+def looks_like_dob(v):
+    """
+    Detect date-of-birth strings like:
+    01/23/1958
+    1-23-58
+    1958-01-23
+    """
+    if not v:
+        return False
+
+    v = v.strip()
+
+    # common separators
+    for sep in ["/", "-", "."]:
+        parts = v.split(sep)
+        if len(parts) == 3:
+            try:
+                nums = [int(p) for p in parts]
+                # basic sanity checks
+                if 1900 <= nums[0] <= 2025 or 1900 <= nums[2] <= 2025:
+                    return True
+            except ValueError:
+                pass
+
+    return False
+
 def looks_like_age(v):
     return v.isdigit() and 18 <= int(v) <= 110
 
