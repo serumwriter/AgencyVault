@@ -373,7 +373,6 @@ def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form
     )
 
     # ✅ AI decision happens automatically
-    lead.ai_decision = simple_ai_decide(lead)
 
     db.add(lead)
     db.commit()
