@@ -1,6 +1,6 @@
 print(">>> LOADED agencyvault_app/main.py <<<")
 
-TWILIO_ENABLED = False
+TWILIO_ENABLED = true
 
 import os
 import re
