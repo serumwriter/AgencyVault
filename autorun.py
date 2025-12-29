@@ -27,10 +27,11 @@ else:
     print("AI response:", r.status_code)
 
         except Exception as e:
-            print("AI autorun error:", e)
+    print("AI autorun error:", e)
 
-        # sleep 10 minutes
-       time.sleep(2)
+        # short sleep to prevent CPU spinning
+        time.sleep(2)
+
 
 
 if __name__ == "__main__":
