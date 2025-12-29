@@ -54,15 +54,18 @@ class Lead(Base):
     state = Column(String(10))
     zip = Column(String(20))
 
-    lead_type = Column(String(50))  # FEX, Aged, Vet, etc.
+    lead_type = Column(String(50))
 
-    # 🔹 ADD THESE TWO LINES
     dial_score = Column(Integer, default=0)
     dial_status = Column(String(20), default="HOLD")
+
+    # ✅ AI decision (safe, no external deps)
+    ai_decision = Column(String(50), default="unprocessed")
 
     notes = Column(Text)
     status = Column(String(50), default="new")
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 
@@ -196,6 +199,16 @@ button {{ background:#2563eb;color:white;border:none }}
 </body>
 </html>"""
 
+def simple_ai_decide(lead):
+    # Extremely safe, no external calls
+    if not lead.phone:
+        return "incomplete"
+
+    if lead.age and lead.age < 25:
+        return "follow_up"
+
+    return "call_now"
+
 # -------------------------------------------------
 # ROUTES
 # -------------------------------------------------
@@ -243,6 +256,7 @@ def dashboard():
           <div style="margin-top:6px;">
             <strong>Dial Score:</strong> {l.dial_score}<br>
             <strong>Status:</strong> {l.dial_status}
+            <br><strong>AI Decision:</strong> {l.ai_decision}
           </div>
 
           <form method="post" action="/leads/delete/{l.id}">
@@ -325,14 +339,22 @@ def start_dialing():
 @app.post("/leads/create")
 def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form("")):
     db = SessionLocal()
-    db.add(Lead(
+
+    lead = Lead(
         full_name=name,
         phone=normalize_phone(phone),
         email=email or None
-    ))
+    )
+
+    # ✅ AI decision happens automatically
+    lead.ai_decision = simple_ai_decide(lead)
+
+    db.add(lead)
     db.commit()
     db.close()
+
     return RedirectResponse("/dashboard", status_code=302)
+
 
 @app.post("/leads/delete/{lead_id}")
 def delete_lead(lead_id: int):
@@ -484,27 +506,3 @@ def start_dialing():
 
     return RedirectResponse("/dashboard", status_code=302)
 
-@app.get("/ai/decide/{lead_id}")
-def ai_decide_lead(lead_id: int):
-    db = SessionLocal()
-
-    lead = db.query(Lead).filter(Lead.id == lead_id).first()
-    if not lead:
-        db.close()
-        return {"ok": False, "error": "Lead not found"}
-
-    decision = decide_next_action(lead)
-
-    db.close()
-
-    return {
-        "ok": True,
-        "lead_id": lead_id,
-        "decision": decision["decision"],
-        "reason": decision["reason"],
-        "cooldown_until": (
-            decision["cooldown_until"].isoformat()
-            if decision["cooldown_until"]
-            else None
-        ),
-    }
