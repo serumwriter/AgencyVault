@@ -12,7 +12,6 @@ from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-from elevenlabs_voice import synthesize_wav
 from twilio_client import (
     get_twilio_client,
     get_from_number,
