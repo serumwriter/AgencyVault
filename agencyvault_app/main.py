@@ -324,12 +324,30 @@ def start_dialing():
         db.query(Lead)
         .filter(Lead.dial_status == "READY")
         .order_by(Lead.dial_score.desc())
-        .limit(10)
+        .limit(5)
         .all()
     )
 
+    # Always do the queueing (safe)
     for i, lead in enumerate(leads, start=1):
         lead.dial_queue_position = i
+
+    # Only place calls if Twilio is enabled
+    if TWILIO_ENABLED and leads:
+        try:
+            base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+            if not base_url:
+                raise RuntimeError("PUBLIC_BASE_URL not set")
+
+            twiml_url = f"{base_url}/twiml/placeholder"
+
+            # Call ONLY the first lead for now (safe)
+            lead = leads[0]
+            place_call(lead.phone, twiml_url)
+            lead.dial_status = "CALLED"
+
+        except Exception as e:
+            print("Dialing failed:", e)
 
     db.commit()
     db.close()
