@@ -212,7 +212,7 @@ from .ai_employee import run_ai_engine
 # ROUTES
 # -------------------------------------------------
 
-@app.post("/ai/run")
+@app.get("/ai/run")
 def run_ai():
     db = SessionLocal()
     run_ai_engine(db, Lead)
