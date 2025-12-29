@@ -159,20 +159,30 @@ def dashboard():
         rows = "<div class='card'>No leads yet</div>"
 
     return HTMLResponse(f"""
-    <html>
-    <body>
-    <div class="card">
-      <h3>Add Lead</h3>
-      <form method="post" action="/leads/create">
-        <input name="name" placeholder="Full Name" required>
-        <input name="phone" placeholder="Phone" required>
-        <input name="email" placeholder="Email">
-        <button>Add Lead</button>
-      </form>
-    </div>
+          html = (
+        "<html><body>"
+        "<div class='card'>"
+        "<h3>Add Lead</h3>"
+        "<form method='post' action='/leads/create'>"
+        "<input name='name' placeholder='Full Name' required>"
+        "<input name='phone' placeholder='Phone' required>"
+        "<input name='email' placeholder='Email'>"
+        "<button>Add Lead</button>"
+        "</form>"
+        "</div>"
+        "<div class='card'>"
+        "<h3>Bulk Upload (CSV)</h3>"
+        "<form method='post' action='/leads/upload' enctype='multipart/form-data'>"
+        "<input type='file' name='file' accept='.csv' required>"
+        "<button>Upload</button>"
+        "</form>"
+        "</div>"
+        + rows +
+        "</body></html>"
+    )
 
-    <div class="card">
-      <h3>Bulk Upload (CSV)</h3>
-      <form method="post" action="/lea
+    return HTMLResponse(html)
+
+
 
 
