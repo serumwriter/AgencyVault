@@ -12,6 +12,7 @@ import os
 import re
 import csv
 from datetime import datetime
+from ai_tasks import create_task
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -106,10 +107,27 @@ def health():
 @app.get("/ai/run")
 def run_ai():
     db = SessionLocal()
-    run_ai_engine(db, Lead)
-    db.commit()
+
+    # Run AI engine in ANALYSIS mode only
+    actions = run_ai_engine(db, Lead, plan_only=True)
+
+    created = 0
+
+    for action in actions:
+        create_task(
+            task_type=action["type"],
+            lead_id=action.get("lead_id"),
+            payload=str(action)
+        )
+        created += 1
+
     db.close()
-    return {"ok": True}
+
+    return {
+        "ok": True,
+        "planned_tasks": created
+    }
+
 
 @app.get("/")
 def root():
