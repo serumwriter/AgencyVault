@@ -484,62 +484,6 @@ def start_dialing():
 
     return RedirectResponse("/dashboard", status_code=302)
 
-
-
-
-
-@app.get("/twiml/sarah-test")
-def twiml_sarah_test():
-    base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>{base_url}/audio/sarah-test.wav</Play>
-  <Hangup/>
-</Response>
-"""
-    return Response(content=xml, media_type="application/xml")
-
-
-
-@app.post("/dial/test")
-def dial_test_call():
-    if not allow_test_calls():
-        return {
-            "ok": False,
-            "error": "Test calls disabled. Set TWILIO_ALLOW_TEST_CALLS=true."
-        }
-
-@app.get("/audio/sarah-test.wav")
-def audio_sarah_test():
-    script = (
-        "Hi, this is Sarah with Family First Life. "
-        "I’m following up on a request for life insurance information. "
-        "This will only take a moment — is now an okay time?"
-    )
-    wav = synthesize_wav(script)
-    return Response(content=wav, media_type="audio/wav")
-
-    base_url = os.environ.get("PUBLIC_BASE_URL", "").strip()
-    if not base_url:
-        return {
-            "ok": False,
-            "error": "PUBLIC_BASE_URL missing."
-        }
-
-    client = get_twilio_client()
-
-    call = client.calls.create(
-        to=get_test_to_number(),
-        from_=get_from_number(),
-        url=base_url.rstrip("/") + "/twiml/sarah-test",
-        method="GET",
-    )
-
-    return {
-        "ok": True,
-        "call_sid": call.sid,
-        "status": call.status,
-    }
 @app.get("/ai/decide/{lead_id}")
 def ai_decide_lead(lead_id: int):
     db = SessionLocal()
