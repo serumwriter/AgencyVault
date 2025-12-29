@@ -94,7 +94,7 @@ def looks_like_name(s):
 # ==============================
 # AI ENGINE (FLAT IMPORT — SAFE)
 # ==============================
-from ai_employee import run_ai_engine
+from .ai_employee import run_ai_engine
 
 # ==============================
 # ROUTES
