@@ -1,5 +1,7 @@
 print(">>> LOADED agencyvault_app/main.py <<<")
 
+TWILIO_ENABLED = False
+
 import os
 import re
 import csv
@@ -11,7 +13,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
-
+if TWILIO_ENABLED:
+    from twilio_client import place_call
 
 
 
