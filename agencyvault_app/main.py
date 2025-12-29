@@ -1,13 +1,13 @@
 print(">>> LOADED agencyvault_app/main.py <<<")
 
-# -------------------------------------------------
-# SAFE FLAGS
-# -------------------------------------------------
-TWILIO_ENABLED = False  # NEVER True during deploy
+# ==============================
+# FLAGS
+# ==============================
+TWILIO_ENABLED = False
 
-# -------------------------------------------------
+# ==============================
 # IMPORTS
-# -------------------------------------------------
+# ==============================
 import os
 import re
 import csv
@@ -20,12 +20,12 @@ from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# -------------------------------------------------
-# CONFIG
-# -------------------------------------------------
+# ==============================
+# DATABASE
+# ==============================
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
+    raise RuntimeError("DATABASE_URL not set")
 
 DATABASE_URL = DATABASE_URL.replace(
     "postgresql://", "postgresql+psycopg://"
@@ -35,19 +35,18 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# -------------------------------------------------
-# MODELS (AI-FIRST)
-# -------------------------------------------------
+# ==============================
+# MODEL
+# ==============================
 class Lead(Base):
     __tablename__ = "leads"
 
     id = Column(Integer, primary_key=True)
-
     full_name = Column(String(255))
     phone = Column(String(50), index=True)
     email = Column(String(255))
 
-    # AI employee fields
+    # AI fields
     state = Column(String(30), default="NEW")
     ai_priority = Column(Integer, default=0)
     ai_next_action = Column(String(50))
@@ -55,22 +54,21 @@ class Lead(Base):
 
     ai_last_action_at = Column(DateTime)
     ai_next_action_at = Column(DateTime)
-
     appointment_at = Column(DateTime)
 
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
-# -------------------------------------------------
+# ==============================
 # APP
-# -------------------------------------------------
+# ==============================
 app = FastAPI(title="AgencyVault")
 app.add_middleware(SessionMiddleware, secret_key="CHANGE_ME")
 
-# -------------------------------------------------
+# ==============================
 # HELPERS
-# -------------------------------------------------
+# ==============================
 def normalize_phone(s):
     d = re.sub(r"\D", "", s or "")
     if len(d) == 10:
@@ -93,32 +91,14 @@ def looks_like_name(s):
         return False
     return all(p.isalpha() and p[0].isupper() for p in parts)
 
-def page(title, body):
-    return f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>
-body {{ background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px }}
-.card {{ background:#111827;padding:16px;margin:16px 0;border-radius:12px }}
-input,button {{ padding:10px;width:100%;margin:6px 0 }}
-button {{ background:#2563eb;color:white;border:none }}
-</style>
-</head>
-<body>
-{body}
-</body>
-</html>"""
+# ==============================
+# AI ENGINE (FLAT IMPORT — SAFE)
+# ==============================
+from ai_employee import run_ai_engine
 
-# -------------------------------------------------
-# AI EMPLOYEE
-# -------------------------------------------------
-from .ai_employee import run_ai_engine
-
-# -------------------------------------------------
+# ==============================
 # ROUTES
-# -------------------------------------------------
+# ==============================
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -143,24 +123,27 @@ def dashboard():
 
     rows = ""
     for l in leads:
-        rows += f"""
-        <div class="card">
-          <b>{l.full_name}</b><br>
-          {l.phone}<br>
-          {l.email or ""}
-          <div style="margin-top:6px;">
-            <strong>AI State:</strong> {l.state}<br>
-            <strong>Next Action:</strong> {l.ai_next_action or ""}
-          </div>
-        </div>
-        """
+        rows += (
+            "<div class='card'>"
+            f"<b>{l.full_name}</b><br>"
+            f"{l.phone}<br>"
+            f"{l.email or ''}<br>"
+            f"<strong>AI State:</strong> {l.state}<br>"
+            f"<strong>Next Action:</strong> {l.ai_next_action or ''}"
+            "</div>"
+        )
 
     if not rows:
         rows = "<div class='card'>No leads yet</div>"
 
-    return HTMLResponse(f"""
-          html = (
-        "<html><body>"
+    html = (
+        "<html><head><meta charset='utf-8'>"
+        "<style>"
+        "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
+        ".card{background:#111827;padding:16px;margin:16px 0;border-radius:12px}"
+        "input,button{padding:10px;width:100%;margin:6px 0}"
+        "button{background:#2563eb;color:white;border:none}"
+        "</style></head><body>"
         "<div class='card'>"
         "<h3>Add Lead</h3>"
         "<form method='post' action='/leads/create'>"
@@ -182,6 +165,57 @@ def dashboard():
     )
 
     return HTMLResponse(html)
+
+@app.post("/leads/create")
+def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form("")):
+    db = SessionLocal()
+    lead = Lead(
+        full_name=name,
+        phone=normalize_phone(phone),
+        email=email or None,
+    )
+    db.add(lead)
+    db.commit()
+    db.close()
+    return RedirectResponse("/dashboard", status_code=302)
+
+@app.post("/leads/upload")
+def upload(file: UploadFile = File(...)):
+    raw = file.file.read().decode("utf-8", errors="ignore").splitlines()
+    rows = [r for r in csv.reader(raw) if any(c.strip() for c in r)]
+
+    db = SessionLocal()
+    imported = 0
+
+    for r in rows:
+        values = [c.strip() for c in r if c.strip()]
+
+        name = next((v for v in values if looks_like_name(v)), "")
+        phone = next((v for v in values if looks_like_phone(v)), "")
+        email = next((v for v in values if looks_like_email(v)), "")
+
+        if not name or not phone:
+            continue
+
+        lead = Lead(
+            full_name=name,
+            phone=normalize_phone(phone),
+            email=email or None,
+            ai_reason="; ".join(values),
+        )
+        db.add(lead)
+        imported += 1
+
+    db.commit()
+    db.close()
+
+    return HTMLResponse(
+        "<html><body>"
+        f"<h3>Imported: {imported}</h3>"
+        "<a href='/dashboard'>Back</a>"
+        "</body></html>"
+    )
+
 
 
 
