@@ -30,7 +30,8 @@ else:
             print("AI autorun error:", e)
 
         # sleep 10 minutes
-        time.sleep(600)
+       time.sleep(2)
+
 
 if __name__ == "__main__":
     run_forever()
