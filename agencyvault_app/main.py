@@ -160,7 +160,65 @@ def root():
     return RedirectResponse("/dashboard")
 @app.get("/tasks")
 def view_tasks():
-    tasks = fetch_ready_tasks(limit=25)
+    db = SessionLocal()
+
+    # Pull actionable tasks only
+    rows = db.execute("""
+        SELECT
+            t.id,
+            t.task_type,
+            t.run_at,
+            l.full_name,
+            l.phone,
+            l.ai_priority
+        FROM ai_tasks t
+        JOIN leads l ON l.id = t.lead_id
+        WHERE t.status = 'NEW'
+          AND t.task_type IN ('CALL', 'WAIT')
+        ORDER BY
+            CASE t.task_type
+                WHEN 'CALL' THEN 1
+                WHEN 'WAIT' THEN 2
+                ELSE 3
+            END,
+            l.ai_priority DESC,
+            t.run_at
+        LIMIT 50
+    """).fetchall()
+
+    db.close()
+
+    cards = ""
+
+    for r in rows:
+        icon = "📞" if r.task_type == "CALL" else "⏳"
+        when = "now" if not r.run_at else r.run_at.strftime("%Y-%m-%d %H:%M UTC")
+
+        cards += (
+            "<div class='card'>"
+            f"<h3>{icon} {r.task_type}</h3>"
+            f"<b>{r.full_name}</b><br>"
+            f"{r.phone}<br>"
+            f"<small>Priority: {r.ai_priority}</small><br>"
+            f"<small>Run at: {when}</small>"
+            "</div>"
+        )
+
+    if not cards:
+        cards = "<div class='card'>No actionable tasks</div>"
+
+    return HTMLResponse(
+        "<html><head><style>"
+        "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
+        ".card{background:#111827;padding:16px;margin:16px 0;border-radius:12px}"
+        "h3{margin:0 0 6px 0}"
+        "</style></head><body>"
+        "<h2>AI Employee Task Board</h2>"
+        + cards +
+        "<a href='/dashboard' style='color:#93c5fd'>← Back</a>"
+        "</body></html>"
+    )
+
 
     rows = ""
     for t in tasks:
