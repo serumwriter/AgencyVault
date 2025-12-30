@@ -1,112 +1,123 @@
 from datetime import datetime, timedelta, timezone
 
-# Very simple phone → timezone mapping (US only for now)
-AREA_CODE_TIMEZONE = {
-    # Pacific
-    "209": "US/Pacific", "213": "US/Pacific", "310": "US/Pacific", "415": "US/Pacific",
-    # Mountain
-    "303": "US/Mountain", "406": "US/Mountain",
-    # Central
-    "312": "US/Central", "214": "US/Central", "713": "US/Central",
-    # Eastern
-    "212": "US/Eastern", "305": "US/Eastern", "404": "US/Eastern",
-}
+# ---------------------------------
+# CONFIG (SAFE DEFAULTS)
+# ---------------------------------
+MAX_CALL_ATTEMPTS_PER_DAY = 3
+CALL_RETRY_MINUTES = 15
 
+# ---------------------------------
+# PRIORITY SCORING
+# ---------------------------------
 def _basic_priority(lead) -> int:
     score = 0
     if lead.phone:
         score += 50
     if lead.email:
         score += 15
+
     if lead.created_at:
         age_hours = (datetime.utcnow() - lead.created_at).total_seconds() / 3600
         if age_hours < 24:
             score += 20
         elif age_hours < 72:
             score += 10
+
     return score
 
-def _infer_timezone_from_phone(phone: str):
-    if not phone or len(phone) < 5:
-        return pytz.UTC
-    area = phone.replace("+1", "")[:3]
-    tz_name = AREA_CODE_TIMEZONE.get(area)
-    return pytz.timezone(tz_name) if tz_name else pytz.UTC
+# ---------------------------------
+# CALL WINDOW (UTC-SAFE)
+# ---------------------------------
+def _can_call_now(now_utc: datetime) -> bool:
+    hour = now_utc.hour
+    # Conservative US-safe window
+    return 14 <= hour or hour < 2
 
-def _next_allowed_call_time(local_now):
-    start = local_now.replace(hour=8, minute=0, second=0, microsecond=0)
-    end = local_now.replace(hour=21, minute=0, second=0, microsecond=0)
+def _next_call_time(now_utc: datetime) -> datetime:
+    if _can_call_now(now_utc):
+        return now_utc
+    if now_utc.hour < 14:
+        return now_utc.replace(hour=14, minute=0, second=0, microsecond=0)
+    return (now_utc + timedelta(days=1)).replace(
+        hour=14, minute=0, second=0, microsecond=0
+    )
 
-    if local_now < start:
-        return start
-    if local_now > end:
-        return start + timedelta(days=1)
-    return local_now
-
-def _can_call_now(local_now):
-    return 8 <= local_now.hour < 21
-
+# ---------------------------------
+# POWER DIALER AI ENGINE
+# ---------------------------------
 def run_ai_engine(db, Lead, plan_only: bool = True, batch_size: int = 25):
+    now = datetime.now(timezone.utc)
+    actions = []
+
     leads = (
         db.query(Lead)
-        .filter(Lead.state == "NEW")
-        .order_by(Lead.created_at.asc())
+        .filter(Lead.state.in_(["NEW", "TRIAGED"]))
+        .order_by(Lead.ai_priority.desc(), Lead.created_at.asc())
         .limit(batch_size)
         .all()
     )
 
-    actions = []
-    now_utc = datetime.now(timezone.utc)
-
     for lead in leads:
+        # Ensure counters exist
+        lead.call_attempts = lead.call_attempts or 0
+
         priority = _basic_priority(lead)
-        tz = _infer_timezone_from_phone(lead.phone)
-        local_now = now_utc.astimezone(tz)
-
         lead.ai_priority = priority
-        lead.ai_reason = f"Priority={priority}"
-        lead.ai_last_action_at = now_utc
+        lead.ai_last_action_at = now
 
-        # Always record triage
+        # Reset daily attempts if day changed
+        if lead.last_call_attempt_at:
+            if lead.last_call_attempt_at.date() != now.date():
+                lead.call_attempts = 0
+
+        # Decide behavior
+        if not lead.phone:
+            lead.ai_next_action = "REVIEW"
+            lead.ai_reason = "No phone number"
+            lead.ai_next_action_at = now + timedelta(hours=4)
+            lead.state = "TRIAGED"
+            continue
+
+        if lead.call_attempts >= MAX_CALL_ATTEMPTS_PER_DAY:
+            lead.ai_next_action = "WAIT"
+            lead.ai_reason = "Max daily attempts reached"
+            lead.ai_next_action_at = now + timedelta(hours=12)
+            lead.state = "WAITING"
+            continue
+
+        if lead.last_call_attempt_at:
+            minutes_since = (now - lead.last_call_attempt_at).total_seconds() / 60
+            if minutes_since < CALL_RETRY_MINUTES:
+                lead.ai_next_action = "WAIT"
+                lead.ai_reason = f"Cooldown ({int(CALL_RETRY_MINUTES - minutes_since)} min left)"
+                lead.ai_next_action_at = lead.last_call_attempt_at + timedelta(minutes=CALL_RETRY_MINUTES)
+                lead.state = "WAITING"
+                continue
+
+        # Call window check
+        next_time = _next_call_time(now)
+        if next_time > now:
+            lead.ai_next_action = "WAIT"
+            lead.ai_reason = "Outside legal call window"
+            lead.ai_next_action_at = next_time
+            lead.state = "WAITING"
+            continue
+
+        # PLAN CALL
+        lead.call_attempts += 1
+        lead.last_call_attempt_at = now
+        lead.ai_next_action = "CALL"
+        lead.ai_reason = f"Attempt {lead.call_attempts}"
+        lead.ai_next_action_at = now
+        lead.state = "CALLING"
+
         actions.append({
-            "type": "LEAD_TRIAGED",
+            "type": "CALL",
             "lead_id": lead.id,
             "priority": priority,
+            "attempt": lead.call_attempts,
+            "note": "Planned call (no execution yet)",
         })
-
-        if lead.phone:
-            if _can_call_now(local_now):
-                # CALL NOW
-                lead.ai_next_action = "CALL"
-                lead.ai_next_action_at = now_utc
-
-                actions.append({
-                    "type": "CALL",
-                    "lead_id": lead.id,
-                    "priority": priority,
-                    "run_at": now_utc.isoformat(),
-                    "note": "Legal call window open",
-                })
-            else:
-                # WAIT until legal window
-                next_local = _next_allowed_call_time(local_now)
-                next_utc = next_local.astimezone(pytz.UTC)
-
-                lead.ai_next_action = "WAIT"
-                lead.ai_next_action_at = next_utc
-
-                actions.append({
-                    "type": "WAIT",
-                    "lead_id": lead.id,
-                    "priority": priority,
-                    "run_at": next_utc.isoformat(),
-                    "note": "Outside legal calling hours",
-                })
-        else:
-            lead.ai_next_action = "REVIEW"
-            lead.ai_next_action_at = now_utc + timedelta(hours=4)
-
-        lead.state = "TRIAGED"
 
     db.commit()
     return actions
