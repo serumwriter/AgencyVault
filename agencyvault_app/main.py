@@ -174,28 +174,29 @@ def view_tasks():
     db = SessionLocal()
 
     # Pull actionable tasks only
-    rows = db.execute("""
-        SELECT
-            t.id,
-            t.task_type,
-            t.run_at,
-            l.full_name,
-            l.phone,
-            l.ai_priority
-        FROM ai_tasks t
-        JOIN leads l ON l.id = t.lead_id
-        WHERE t.status = 'NEW'
-          AND t.task_type IN ('CALL', 'WAIT')
-        ORDER BY
-            CASE t.task_type
-                WHEN 'CALL' THEN 1
-                WHEN 'WAIT' THEN 2
-                ELSE 3
-            END,
-            l.ai_priority DESC,
-            t.run_at
-        LIMIT 50
-    """).fetchall()
+   rows = db.execute("""
+    SELECT
+        t.id,
+        t.task_type,
+        t.created_at,
+        l.full_name,
+        l.phone,
+        l.ai_priority
+    FROM ai_tasks t
+    JOIN leads l ON l.id = t.lead_id
+    WHERE t.status = 'NEW'
+      AND t.task_type IN ('CALL', 'WAIT')
+    ORDER BY
+        CASE t.task_type
+            WHEN 'CALL' THEN 1
+            WHEN 'WAIT' THEN 2
+            ELSE 3
+        END,
+        l.ai_priority DESC,
+        t.created_at
+    LIMIT 50
+""").fetchall()
+
 
     db.close()
 
@@ -203,7 +204,7 @@ def view_tasks():
 
     for r in rows:
         icon = "📞" if r.task_type == "CALL" else "⏳"
-        when = "now" if not r.run_at else r.run_at.strftime("%Y-%m-%d %H:%M UTC")
+        when = r.created_at.strftime("%Y-%m-%d %H:%M UTC")
 
         cards += (
             "<div class='card'>"
