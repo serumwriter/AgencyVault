@@ -21,6 +21,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 from ai_tasks import create_task
+from .ai_employee import run_ai_engine
 
 # ==============================
 # DATABASE
@@ -94,11 +95,6 @@ def looks_like_name(s):
     return all(p.isalpha() and p[0].isupper() for p in parts)
 
 # ==============================
-# AI ENGINE (SAFE IMPORT)
-# ==============================
-from .ai_employee import run_ai_engine
-
-# ==============================
 # ROUTES
 # ==============================
 @app.get("/health")
@@ -107,9 +103,12 @@ def health():
 
 @app.get("/ai/run")
 def run_ai():
+    """
+    Called by the background worker.
+    Plans AI actions only (no calls, no texts).
+    """
     db = SessionLocal()
 
-    # AI PLANNING ONLY — NO SIDE EFFECTS
     actions = run_ai_engine(db, Lead, plan_only=True)
 
     created = 0
@@ -117,7 +116,7 @@ def run_ai():
         create_task(
             task_type=action["type"],
             lead_id=action.get("lead_id"),
-            payload=str(action)
+            payload=str(action),
         )
         created += 1
 
@@ -192,7 +191,7 @@ def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form
         phone=normalize_phone(phone),
         email=email or None,
         state="NEW",
-        ai_reason=None
+        ai_reason=None,
     )
     db.add(lead)
     db.commit()
@@ -222,7 +221,7 @@ def upload(file: UploadFile = File(...)):
             phone=normalize_phone(phone),
             email=email or None,
             state="NEW",
-            ai_reason=None
+            ai_reason=None,
         )
 
         db.add(lead)
@@ -237,4 +236,3 @@ def upload(file: UploadFile = File(...)):
         "<a href='/dashboard'>Back</a>"
         "</body></html>"
     )
-
