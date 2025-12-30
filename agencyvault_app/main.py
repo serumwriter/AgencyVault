@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 
 from ai_tasks import create_task
 from .ai_employee import run_ai_engine
+from ai_tasks import fetch_ready_tasks, mark_task_status
 
 # ==============================
 # DATABASE
@@ -157,6 +158,70 @@ def run_ai():
 @app.get("/")
 def root():
     return RedirectResponse("/dashboard")
+@app.get("/tasks")
+def view_tasks():
+    tasks = fetch_ready_tasks(limit=25)
+
+    rows = ""
+    for t in tasks:
+        rows += (
+            "<div class='card'>"
+            f"<b>Task:</b> {t['task_type']}<br>"
+            f"<b>Lead ID:</b> {t['lead_id'] or '-'}<br>"
+            f"<b>Status:</b> {t['status']}<br>"
+            f"<b>Run At:</b> {t['run_at'] or 'now'}<br>"
+            f"<pre style='white-space:pre-wrap'>{t['payload'] or ''}</pre>"
+            "</div>"
+        )
+
+    if not rows:
+        rows = "<div class='card'>No ready tasks</div>"
+
+    return HTMLResponse(
+        "<html><head><style>"
+        "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
+        ".card{background:#111827;padding:16px;margin:16px 0;border-radius:12px}"
+        "</style></head><body>"
+        "<h2>AI Task Queue</h2>"
+        + rows +
+        "<a href='/dashboard' style='color:#93c5fd'>← Back</a>"
+        "</body></html>"
+    )
+AI_AUTOMATIONS_ENABLED = os.getenv("AI_AUTOMATIONS_ENABLED", "false").lower() == "true"
+AI_DRY_RUN = os.getenv("AI_DRY_RUN", "true").lower() == "true"
+
+@app.post("/tasks/execute")
+def execute_tasks():
+    if not AI_AUTOMATIONS_ENABLED:
+        return {"ok": False, "reason": "AI automations disabled"}
+
+    tasks = fetch_ready_tasks(limit=5)
+    executed = []
+
+    for task in tasks:
+        task_id = task["id"]
+        task_type = task["task_type"]
+
+        if AI_DRY_RUN:
+            mark_task_status(task_id, "SKIPPED")
+            executed.append({
+                "id": task_id,
+                "task": task_type,
+                "dry_run": True
+            })
+            continue
+
+        # 🔥 REAL EXECUTION WILL GO HERE LATER
+        # CALL / TEXT / FOLLOW_UP
+
+        mark_task_status(task_id, "DONE")
+        executed.append({
+            "id": task_id,
+            "task": task_type,
+            "dry_run": False
+        })
+
+    return {"ok": True, "executed": executed}
 
 # ==============================
 # DASHBOARD
