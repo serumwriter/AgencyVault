@@ -14,7 +14,8 @@ import csv
 from datetime import datetime
 
 from fastapi import FastAPI, Form, UploadFile, File
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
@@ -67,6 +68,8 @@ Base.metadata.create_all(bind=engine)
 # APP
 # ==============================
 app = FastAPI(title="AgencyVault")
+
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 app.add_middleware(SessionMiddleware, secret_key="CHANGE_ME")
 
 # ==============================
@@ -90,7 +93,6 @@ def looks_like_name(s):
     if not s:
         return False
 
-    # Words that should NEVER be treated as a person's name
     banned_words = {
         "lead", "gold", "silver", "bronze",
         "tier", "status", "priority",
@@ -98,8 +100,6 @@ def looks_like_name(s):
     }
 
     parts = s.strip().split()
-
-    # Real names are usually 2–3 words, rarely 4
     if not (2 <= len(parts) <= 3):
         return False
 
@@ -113,9 +113,25 @@ def looks_like_name(s):
 
     return True
 
+# ==============================
+# PWA ROUTES
+# ==============================
+@app.get("/manifest.json")
+def manifest():
+    return FileResponse(
+        "app/static/manifest.json",
+        media_type="application/manifest+json"
+    )
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(
+        "app/static/sw.js",
+        media_type="application/javascript"
+    )
 
 # ==============================
-# ROUTES
+# SYSTEM ROUTES
 # ==============================
 @app.get("/health")
 def health():
@@ -123,12 +139,7 @@ def health():
 
 @app.get("/ai/run")
 def run_ai():
-    """
-    Called by the background worker.
-    Plans AI actions only (no calls, no texts).
-    """
     db = SessionLocal()
-
     actions = run_ai_engine(db, Lead, plan_only=True)
 
     created = 0
@@ -136,7 +147,7 @@ def run_ai():
         create_task(
             task_type=action["type"],
             lead_id=action.get("lead_id"),
-            payload=str(action),
+            payload=str(action)
         )
         created += 1
 
@@ -147,11 +158,13 @@ def run_ai():
 def root():
     return RedirectResponse("/dashboard")
 
+# ==============================
+# DASHBOARD
+# ==============================
 @app.get("/dashboard")
 def dashboard():
     db = SessionLocal()
 
-    # 🔑 NEVER LOAD ALL LEADS
     leads = (
         db.query(Lead)
         .order_by(Lead.created_at.desc())
@@ -177,12 +190,23 @@ def dashboard():
         rows = "<div class='card'>No leads yet</div>"
 
     return HTMLResponse(
-        "<html><head><style>"
+        "<html><head>"
+        "<meta charset='utf-8'>"
+
+        "<link rel='manifest' href='/manifest.json'>"
+        "<meta name='theme-color' content='#0b0f17'>"
+        "<link rel='apple-touch-icon' href='/static/icons/icon-192.png'>"
+        "<meta name='apple-mobile-web-app-capable' content='yes'>"
+        "<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>"
+
+        "<style>"
         "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
         ".card{background:#111827;padding:16px;margin:16px 0;border-radius:12px}"
         "input,button{padding:10px;width:100%;margin:6px 0}"
         "button{background:#2563eb;color:white;border:none}"
-        "</style></head><body>"
+        "</style>"
+        "</head><body>"
+
         "<div class='card'>"
         "<h3>Add Lead</h3>"
         "<form method='post' action='/leads/create'>"
@@ -192,6 +216,7 @@ def dashboard():
         "<button>Add Lead</button>"
         "</form>"
         "</div>"
+
         "<div class='card'>"
         "<h3>Bulk Upload (CSV)</h3>"
         "<form method='post' action='/leads/upload' enctype='multipart/form-data'>"
@@ -199,25 +224,42 @@ def dashboard():
         "<button>Upload</button>"
         "</form>"
         "</div>"
+
         + rows +
+
+        "<script>"
+        "if ('serviceWorker' in navigator) {"
+        "navigator.serviceWorker.register('/sw.js');"
+        "}"
+        "</script>"
+
         "</body></html>"
     )
 
+# ==============================
+# LEAD CREATION
+# ==============================
 @app.post("/leads/create")
-def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form("")):
+def create_lead(
+    name: str = Form(...),
+    phone: str = Form(...),
+    email: str = Form("")
+):
     db = SessionLocal()
     lead = Lead(
         full_name=name,
         phone=normalize_phone(phone),
         email=email or None,
-        state="NEW",
-        ai_reason=None,
+        state="NEW"
     )
     db.add(lead)
     db.commit()
     db.close()
     return RedirectResponse("/dashboard", status_code=302)
 
+# ==============================
+# BULK CSV UPLOAD
+# ==============================
 @app.post("/leads/upload")
 def upload(file: UploadFile = File(...)):
     raw = file.file.read().decode("utf-8", errors="ignore").splitlines()
@@ -240,8 +282,7 @@ def upload(file: UploadFile = File(...)):
             full_name=name,
             phone=normalize_phone(phone),
             email=email or None,
-            state="NEW",
-            ai_reason=None,
+            state="NEW"
         )
 
         db.add(lead)
