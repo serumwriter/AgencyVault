@@ -12,7 +12,6 @@ import os
 import re
 import csv
 from datetime import datetime
-from ai_tasks import create_task
 
 from fastapi import FastAPI, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -21,10 +20,11 @@ from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
+from ai_tasks import create_task
+
 # ==============================
 # DATABASE
 # ==============================
-
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
@@ -94,7 +94,7 @@ def looks_like_name(s):
     return all(p.isalpha() and p[0].isupper() for p in parts)
 
 # ==============================
-# AI ENGINE (FLAT IMPORT — SAFE)
+# AI ENGINE (SAFE IMPORT)
 # ==============================
 from .ai_employee import run_ai_engine
 
@@ -109,11 +109,10 @@ def health():
 def run_ai():
     db = SessionLocal()
 
-    # Run AI engine in ANALYSIS mode only
+    # AI PLANNING ONLY — NO SIDE EFFECTS
     actions = run_ai_engine(db, Lead, plan_only=True)
 
     created = 0
-
     for action in actions:
         create_task(
             task_type=action["type"],
@@ -123,12 +122,7 @@ def run_ai():
         created += 1
 
     db.close()
-
-    return {
-        "ok": True,
-        "planned_tasks": created
-    }
-
+    return {"ok": True, "planned_tasks": created}
 
 @app.get("/")
 def root():
@@ -137,7 +131,15 @@ def root():
 @app.get("/dashboard")
 def dashboard():
     db = SessionLocal()
-    leads = db.query(Lead).order_by(Lead.created_at.desc()).all()
+
+    # 🔑 NEVER LOAD ALL LEADS
+    leads = (
+        db.query(Lead)
+        .order_by(Lead.created_at.desc())
+        .limit(50)
+        .all()
+    )
+
     db.close()
 
     rows = ""
@@ -155,9 +157,8 @@ def dashboard():
     if not rows:
         rows = "<div class='card'>No leads yet</div>"
 
-    html = (
-        "<html><head><meta charset='utf-8'>"
-        "<style>"
+    return HTMLResponse(
+        "<html><head><style>"
         "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
         ".card{background:#111827;padding:16px;margin:16px 0;border-radius:12px}"
         "input,button{padding:10px;width:100%;margin:6px 0}"
@@ -183,8 +184,6 @@ def dashboard():
         "</body></html>"
     )
 
-    return HTMLResponse(html)
-
 @app.post("/leads/create")
 def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form("")):
     db = SessionLocal()
@@ -192,6 +191,8 @@ def create_lead(name: str = Form(...), phone: str = Form(...), email: str = Form
         full_name=name,
         phone=normalize_phone(phone),
         email=email or None,
+        state="NEW",
+        ai_reason=None
     )
     db.add(lead)
     db.commit()
@@ -220,8 +221,10 @@ def upload(file: UploadFile = File(...)):
             full_name=name,
             phone=normalize_phone(phone),
             email=email or None,
-            ai_reason="; ".join(values),
+            state="NEW",
+            ai_reason=None
         )
+
         db.add(lead)
         imported += 1
 
@@ -234,8 +237,4 @@ def upload(file: UploadFile = File(...)):
         "<a href='/dashboard'>Back</a>"
         "</body></html>"
     )
-
-
-
-
 
