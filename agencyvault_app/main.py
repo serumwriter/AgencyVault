@@ -56,6 +56,9 @@ class Lead(Base):
     ai_priority = Column(Integer, default=0)
     ai_next_action = Column(String(50))
     ai_reason = Column(Text)
+    
+    call_attempts = Column(Integer, default=0)
+    last_call_attempt_at = Column(DateTime)
 
     ai_last_action_at = Column(DateTime)
     ai_next_action_at = Column(DateTime)
