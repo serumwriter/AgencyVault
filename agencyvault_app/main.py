@@ -89,10 +89,30 @@ def looks_like_email(s):
 def looks_like_name(s):
     if not s:
         return False
+
+    # Words that should NEVER be treated as a person's name
+    banned_words = {
+        "lead", "gold", "silver", "bronze",
+        "tier", "status", "priority",
+        "hot", "warm", "cold", "prospect"
+    }
+
     parts = s.strip().split()
-    if not (2 <= len(parts) <= 4):
+
+    # Real names are usually 2–3 words, rarely 4
+    if not (2 <= len(parts) <= 3):
         return False
-    return all(p.isalpha() and p[0].isupper() for p in parts)
+
+    for p in parts:
+        if not p.isalpha():
+            return False
+        if not p[0].isupper():
+            return False
+        if p.lower() in banned_words:
+            return False
+
+    return True
+
 
 # ==============================
 # ROUTES
