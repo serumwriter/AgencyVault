@@ -1,43 +1,40 @@
 import os
-import sqlite3
 from datetime import datetime
+from sqlalchemy import create_engine, text
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "crm.db")
+# Uses the SAME Postgres as the app
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
 
-def get_db():
-    return sqlite3.connect(DB_PATH)
+DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://")
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 def ensure_ai_tasks_table():
-    db = get_db()
-    c = db.cursor()
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS ai_tasks (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lead_id INTEGER,
-        task_type TEXT NOT NULL,
-        payload TEXT,
-        run_at TEXT,
-        status TEXT DEFAULT 'PENDING',
-        result TEXT,
-        created_at TEXT
-    )
-    """)
-    db.commit()
-    db.close()
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS ai_tasks (
+            id SERIAL PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            lead_id INTEGER NULL,
+            payload TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'NEW',
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        );
+        """))
 
-def create_task(task_type, payload=None, lead_id=None, run_at=None):
-    db = get_db()
-    c = db.cursor()
-    c.execute("""
-        INSERT INTO ai_tasks (lead_id, task_type, payload, run_at, status, created_at)
-        VALUES (?, ?, ?, ?, 'PENDING', ?)
-    """, (
-        lead_id,
-        task_type,
-        payload,
-        run_at,
-        datetime.utcnow().isoformat()
-    ))
-    db.commit()
-    db.close()
+def create_task(task_type: str, lead_id: int | None = None, payload: str | None = None):
+    ensure_ai_tasks_table()
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+            INSERT INTO ai_tasks (task_type, lead_id, payload, status, created_at)
+            VALUES (:task_type, :lead_id, :payload, 'NEW', :created_at)
+            """),
+            {
+                "task_type": task_type,
+                "lead_id": lead_id,
+                "payload": payload,
+                "created_at": datetime.utcnow(),
+            }
+        )
