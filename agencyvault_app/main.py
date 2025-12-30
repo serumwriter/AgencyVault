@@ -67,6 +67,14 @@ class Lead(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
+from sqlalchemy import text
+
+with engine.begin() as conn:
+    conn.execute(text("""
+        ALTER TABLE leads
+        ADD COLUMN IF NOT EXISTS call_attempts INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS last_call_attempt_at TIMESTAMP;
+    """))
 
 # ==============================
 # APP
