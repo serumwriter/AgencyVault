@@ -76,7 +76,7 @@ def run_ai_engine(db, Lead, batch_size=25):
 
     leads = (
         db.query(Lead)
-        .filter(Lead.status == "New")
+        .filter(Lead.state == "NEW")
         .order_by(Lead.created_at.asc())
         .limit(batch_size)
         .all()
