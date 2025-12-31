@@ -72,6 +72,13 @@ def dedupe_exists(db, phone, email):
         return True
     return False
 
+def clean_text(value: str | None):
+    if not value:
+        return None
+    # Remove NULL bytes + non-printable control chars
+    value = value.replace("\x00", "")
+    value = re.sub(r"[\x00-\x1F\x7F]", "", value)
+    return value.strip() or None
 def base_styles():
     return """
     <style>
