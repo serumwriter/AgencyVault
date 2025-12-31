@@ -107,6 +107,17 @@ def run_ai_engine(db, Lead, batch_size=25):
 
         product, prod_ev = detect_product(lead)
         urgent, urg_ev = detect_urgency(lead)
+       from datetime import timedelta
+
+       # when planning a CALL
+       actions.append({
+           "type": "TEXT",
+           "lead_id": lead.id,
+           "due_at": due_at - timedelta(minutes=7),
+           "payload": {
+               "message": f"Hi {lead.full_name.split()[0]}, this is a quick heads-up — I’ll be calling you shortly about your life insurance options."
+           }
+       })
         missing = missing_prequal_fields(lead)
 
         # base decision
