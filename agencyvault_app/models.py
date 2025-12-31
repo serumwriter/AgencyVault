@@ -36,6 +36,7 @@ class Lead(Base):
     state: Mapped[str] = mapped_column(String(30), default="NEW", nullable=False, index=True)
 
     dial_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    product_interest = Column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     last_contacted_at = Column(DateTime, nullable=True)
