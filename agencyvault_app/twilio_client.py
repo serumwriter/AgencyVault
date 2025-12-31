@@ -30,3 +30,25 @@ def get_test_to_number() -> str:
     if not to_number:
         raise RuntimeError("TWILIO_TEST_TO_NUMBER is missing.")
     return to_number
+def send_alert_sms(message: str):
+    """
+    Sends an SMS alert to the human operator when the AI determines
+    human intervention is required.
+    """
+    client = get_twilio_client()
+    from_number = get_from_number()
+
+    # Primary human alert number
+    to_number = os.environ.get("ALERT_PHONE_NUMBER", "").strip()
+    if not to_number:
+        raise RuntimeError("ALERT_PHONE_NUMBER is missing.")
+
+    # Test mode override (safe development)
+    if allow_test_calls():
+        to_number = get_test_to_number()
+
+    client.messages.create(
+        body=message,
+        from_=from_number,
+        to=to_number,
+    )
