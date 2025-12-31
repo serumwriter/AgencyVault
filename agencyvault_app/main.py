@@ -1,6 +1,5 @@
 # agencyvault_app/main.py
-from .database import SessionLocal, engine
-from .models import Lead
+
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from sqlalchemy import text
@@ -10,15 +9,15 @@ import os
 import re
 import json
 
-# ✅ ROOT-LEVEL imports only (Render-safe)
-from database import SessionLocal, engine
-from models import Lead, LeadMemory
+# ✅ PACKAGE-LOCAL IMPORTS (LOCKED — DO NOT CHANGE)
+from .database import SessionLocal, engine
+from .models import Lead
 
-# Your existing modules (keep as-is)
-# If any of these modules are missing in your repo, comment that line and redeploy, then we re-add safely.
+# Existing app modules (keep as-is)
+from .ai_employee import run_ai_engine
+from .twilio_client import send_alert_sms
 from ai_tasks import create_task
-from agencyvault_app.ai_employee import run_ai_engine
-from agencyvault_app.twilio_client import send_alert_sms
+
 
 app = FastAPI(title="AgencyVault")
 
