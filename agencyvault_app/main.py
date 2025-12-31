@@ -215,6 +215,20 @@ def dashboard():
 # ============================================================
 # LEADS
 # ============================================================
+mem = {
+    m.key: m.value
+    for m in db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead.id)
+        .all()
+}
+<h3>🧠 AI Lead Profile</h3>
+<ul>
+  <li>State: {{ mem.get("state","—") }}</li>
+  <li>Smoker: {{ mem.get("smoker","—") }}</li>
+  <li>Medical: {{ mem.get("medical","—") }}</li>
+  <li>Income: {{ mem.get("income","—") }}</li>
+  <li>Product Interest: {{ lead.product_interest or "—" }}</li>
+</ul>
 @app.post("/leads/manual")
 def add_lead_manual(
     full_name: str = Form(""),
@@ -516,5 +530,16 @@ def schedule():
         </body>
         </html>
         """)
+    finally:
+        db.close()
+from fastapi_utils.tasks import repeat_every
+
+@app.on_event("startup")
+@repeat_every(seconds=300)  # every 5 minutes
+def auto_ai_run():
+    db = SessionLocal()
+    try:
+        run_ai_engine(db, Lead)
+        db.commit()
     finally:
         db.close()
