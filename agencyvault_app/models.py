@@ -93,3 +93,6 @@ class Lead(Base):
 
     owner = relationship("User", back_populates="leads")
 
+from .database import engine, Base
+
+Base.metadata.create_all(bind=engine)
