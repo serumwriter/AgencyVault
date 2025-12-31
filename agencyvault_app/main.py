@@ -485,3 +485,36 @@ def tasks():
         """)
     finally:
         db.close()
+@app.get("/schedule", response_class=HTMLResponse)
+def schedule():
+    db = SessionLocal()
+    try:
+        tasks = (
+            db.query(Task)
+            .filter(Task.status == "PENDING")
+            .order_by(Task.due_at.asc())
+            .limit(30)
+            .all()
+        )
+
+        rows = ""
+        for t in tasks:
+            rows += f"""
+            <div style="background:#111827;padding:12px;margin:8px 0;border-radius:8px">
+                <b>{t.type}</b><br>
+                ⏰ {t.due_at or "ASAP"}<br>
+                <a href="/leads/{t.lead_id}">View Lead</a>
+            </div>
+            """
+
+        return HTMLResponse(f"""
+        <html>
+        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+            <h2>📅 Today’s AI Schedule</h2>
+            {rows or "<p>No tasks planned.</p>"}
+            <br><a href="/dashboard">← Dashboard</a>
+        </body>
+        </html>
+        """)
+    finally:
+        db.close()
