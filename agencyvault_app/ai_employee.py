@@ -1,19 +1,11 @@
 from datetime import datetime, timedelta
 import re
-from collections import defaultdict
 
-# =========================
-# CONFIG
-# =========================
-MAX_CALL_ATTEMPTS = 6
 COOLDOWN_MINUTES = 15
-DUPLICATE_PHONE_WEIGHT = 40
-DUPLICATE_EMAIL_WEIGHT = 30
-KEYWORD_WEIGHT = 15
 
-# =========================
-# NORMALIZATION
-# =========================
+def clean_text(*parts):
+    return " ".join([p for p in parts if p]).lower()
+
 def norm_phone(phone):
     if not phone:
         return None
@@ -22,18 +14,11 @@ def norm_phone(phone):
         return "+1" + d
     return d
 
-def clean_text(*parts):
-    return " ".join(p for p in parts if p).lower()
-
-# =========================
-# NAME RESOLUTION (HUMAN-LIKE)
-# =========================
 def resolve_name(lead):
     if lead.full_name:
         name = lead.full_name.strip()
         if len(name.split()) >= 2 and not any(
-            bad in name.lower()
-            for bad in ["life", "insurance", "lead", "center"]
+            bad in name.lower() for bad in ["life", "insurance", "lead", "center"]
         ):
             return name
 
@@ -46,65 +31,45 @@ def resolve_name(lead):
 
     return lead.full_name or "Unknown"
 
-# =========================
-# PRODUCT BRAIN (MAXED)
-# =========================
-def detect_product_and_value(lead):
-    text = clean_text(lead.source, lead.notes, lead.ai_summary)
+def detect_product(lead):
+    t = clean_text(lead.source or "", lead.notes or "", lead.ai_summary or "")
 
-    evidence = []
-    score = 0
-    product = "LIFE"
+    if any(k in t for k in ["annuity", "ira", "401k", "rollover", "cd"]):
+        return "ANNUITY", "retirement/rollover language"
 
-    if any(k in text for k in ["annuity", "ira", "401k", "rollover", "cd"]):
-        product = "ANNUITY"
-        score += 40
-        evidence.append("retirement / rollover language")
+    if any(k in t for k in ["iul", "indexed", "cash value", "tax free"]):
+        return "IUL", "indexed/cash value language"
 
-    if any(k in text for k in ["iul", "indexed", "cash value", "tax free"]):
-        product = "IUL"
-        score += 30
-        evidence.append("cash value / indexed language")
+    return "LIFE", "default life lane"
 
-    if any(k in text for k in ["term", "mortgage", "kids", "income"]):
-        evidence.append("income / family protection language")
+def detect_urgency(lead):
+    t = clean_text(lead.notes or "", lead.ai_summary or "", lead.source or "")
+    if any(k in t for k in ["now", "today", "asap", "immediately", "right now", "ready"]):
+        return True, "urgent intent language"
+    return False, ""
 
-    if any(k in text for k in ["now", "today", "asap", "ready"]):
-        score += 30
-        evidence.append("urgent intent")
+def missing_prequal_fields(lead):
+    missing = []
+    if not lead.state: missing.append("state")
+    if not lead.dob: missing.append("dob")
+    if not lead.smoker: missing.append("smoker")
+    if not lead.height: missing.append("height")
+    if not lead.weight: missing.append("weight")
+    # health_notes can be empty; but if missing all of the above we still want it
+    return missing
 
-    return product, score, "; ".join(evidence) or "default life insurance assumptions"
-
-# =========================
-# DUPLICATE DETECTION
-# =========================
-def detect_duplicate(db, Lead, lead):
-    score = 0
-    evidence = []
-
+def dedupe(db, Lead, lead):
+    # strict dedupe: phone/email
     if lead.phone:
-        dup = db.query(Lead).filter(
-            Lead.phone == lead.phone,
-            Lead.id != lead.id
-        ).first()
+        dup = db.query(Lead).filter(Lead.phone == lead.phone, Lead.id != lead.id).first()
         if dup:
-            score += DUPLICATE_PHONE_WEIGHT
-            evidence.append("duplicate phone")
-
+            return True, "duplicate phone"
     if lead.email:
-        dup = db.query(Lead).filter(
-            Lead.email == lead.email,
-            Lead.id != lead.id
-        ).first()
+        dup = db.query(Lead).filter(Lead.email == lead.email, Lead.id != lead.id).first()
         if dup:
-            score += DUPLICATE_EMAIL_WEIGHT
-            evidence.append("duplicate email")
+            return True, "duplicate email"
+    return False, ""
 
-    return score, "; ".join(evidence)
-
-# =========================
-# MAIN AI ENGINE
-# =========================
 def run_ai_engine(db, Lead, batch_size=25):
     now = datetime.utcnow()
     actions = []
@@ -118,70 +83,71 @@ def run_ai_engine(db, Lead, batch_size=25):
     )
 
     for lead in leads:
-        # -------------------------
-        # BASIC SANITY
-        # -------------------------
         if not lead.phone:
             lead.status = "SKIPPED_NO_PHONE"
             lead.ai_summary = "Skipped: no phone"
             continue
 
-        if lead.last_contacted_at:
-            if lead.last_contacted_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
-                continue
+        # cooldown
+        if lead.last_contacted_at and lead.last_contacted_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
+            continue
 
         lead.full_name = resolve_name(lead)
 
-        # -------------------------
-        # DUPLICATE CHECK
-        # -------------------------
-        dup_score, dup_evidence = detect_duplicate(db, Lead, lead)
-        if dup_score >= 40:
+        # dedupe
+        is_dup, dup_ev = dedupe(db, Lead, lead)
+        if is_dup:
             lead.status = "DUPLICATE"
-            lead.ai_confidence = 90
-            lead.ai_evidence = dup_evidence
+            lead.product_interest = lead.product_interest or "UNKNOWN"
+            lead.ai_confidence = 95
+            lead.ai_evidence = dup_ev
             lead.needs_human = 0
-            lead.ai_summary = "Duplicate lead detected"
+            lead.ai_summary = "Duplicate detected"
             continue
 
-        # -------------------------
-        # PRODUCT + VALUE BRAIN
-        # -------------------------
-        product, value_score, product_evidence = detect_product_and_value(lead)
+        product, prod_ev = detect_product(lead)
+        urgent, urg_ev = detect_urgency(lead)
+        missing = missing_prequal_fields(lead)
 
-        confidence = min(100, value_score + 30)
-        needs_human = 0
+        # base decision
         action = "CALL"
+        needs_human = 0
+        confidence = 55
+        evidence = [prod_ev]
 
-        # -------------------------
-        # ESCALATION RULES
-        # -------------------------
+        # product-based escalation
         if product == "ANNUITY":
-            needs_human = 1
             action = "ESCALATE_HIGH_VALUE"
+            needs_human = 1
+            confidence = 85
+            evidence.append("annuity lane is high value / higher complexity")
 
         elif product == "IUL":
-            needs_human = 1
             action = "ESCALATE_STRATEGY"
-
-        if "urgent" in product_evidence:
             needs_human = 1
+            confidence = 75
+            evidence.append("IUL strategy often needs experienced closer")
+
+        # urgent intent overrides
+        if urgent:
             action = "ESCALATE_NOW"
+            needs_human = 1
             confidence = max(confidence, 90)
+            evidence.append(urg_ev)
 
-        if confidence < 50:
+        # missing prequal fields → ask questions before wasting your time
+        if missing and not urgent:
             action = "NEEDS_INFO"
+            needs_human = 0
+            confidence = 65
+            evidence.append(f"missing prequal: {', '.join(missing)}")
 
-        # -------------------------
-        # WRITE MEMORY
-        # -------------------------
+        # persist memory
         lead.product_interest = product
         lead.ai_confidence = confidence
-        lead.ai_evidence = product_evidence
+        lead.ai_evidence = "; ".join([e for e in evidence if e])
         lead.needs_human = needs_human
-        lead.ai_summary = (
-            f"{product} | confidence {confidence} | {product_evidence}"
-        )
+        lead.ai_summary = f"{product} | conf {confidence} | {lead.ai_evidence}"
         lead.last_contacted_at = now
         lead.status = "AI_PROCESSED"
 
@@ -189,7 +155,7 @@ def run_ai_engine(db, Lead, batch_size=25):
             "type": action,
             "lead_id": lead.id,
             "confidence": confidence,
-            "evidence": product_evidence,
+            "evidence": lead.ai_evidence,
             "needs_human": needs_human,
         })
 
