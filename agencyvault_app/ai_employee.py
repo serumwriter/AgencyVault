@@ -6,23 +6,6 @@ COOLDOWN_MINUTES = 15
 # ----------------------------
 # NORMALIZATION
 # ----------------------------
-def resolve_name(lead):
-    # 1. If name looks real, keep it
-    if lead.full_name:
-        name = lead.full_name.strip()
-        if len(name.split()) >= 2 and "lead" not in name.lower():
-            return name
-
-    # 2. Try email inference
-    if lead.email and "@" in lead.email:
-        local = lead.email.split("@")[0]
-        local = re.sub(r"[0-9_\.]+", " ", local)
-        parts = [p.capitalize() for p in local.split() if len(p) > 2]
-        if len(parts) >= 2:
-            return " ".join(parts[:2])
-
-    # 3. Fallback
-    return lead.full_name or "Unknown"
 def norm_phone(phone):
     if not phone:
         return None
@@ -30,6 +13,30 @@ def norm_phone(phone):
     if len(d) == 10:
         return "+1" + d
     return d
+
+# ----------------------------
+# NAME RESOLUTION (HUMAN-LIKE)
+# ----------------------------
+def resolve_name(lead):
+    # 1. Trust real-looking names
+    if lead.full_name:
+        name = lead.full_name.strip()
+        if (
+            len(name.split()) >= 2
+            and not any(bad in name.lower() for bad in ["lead", "life", "center", "insurance"])
+        ):
+            return name
+
+    # 2. Infer from email
+    if lead.email and "@" in lead.email:
+        local = lead.email.split("@")[0]
+        local = re.sub(r"[0-9_\.]+", " ", local)
+        parts = [p.capitalize() for p in local.split() if len(p) > 2]
+        if len(parts) >= 2:
+            return " ".join(parts[:2])
+
+    # 3. Leave as-is if uncertain
+    return lead.full_name or "Unknown"
 
 # ----------------------------
 # DEDUPE
@@ -60,7 +67,7 @@ def detect_product(lead):
     return "LIFE"
 
 # ----------------------------
-# PRIORITY
+# PRIORITY SCORING
 # ----------------------------
 def score_priority(lead, product):
     score = 10
@@ -100,15 +107,18 @@ def run_ai_engine(db, Lead, batch_size=25):
             lead.state = "SKIPPED"
             continue
 
-        # Cooldown
+        # Cooldown protection
         if lead.ai_last_action_at:
             if lead.ai_last_action_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
                 continue
 
-        # Dedupe
+        # Deduplication
         if find_duplicate(db, Lead, lead):
             lead.state = "DUPLICATE"
             continue
+
+        # Resolve name like a human would
+        lead.full_name = resolve_name(lead)
 
         product = detect_product(lead)
         score = score_priority(lead, product)
