@@ -47,6 +47,24 @@ class Lead(Base):
     # =========================
     # AI EMPLOYEE MEMORY
     # =========================
+       # =========================
+    # AI DECISION GUARDRAILS
+    # =========================
+    product_interest = Column(String(50), default="UNKNOWN")  # LIFE, IUL, ANNUITY, UNKNOWN
+    ai_confidence = Column(Integer, nullable=True)            # 0-100
+    ai_evidence = Column(Text, nullable=True)                 # why AI decided
+    needs_human = Column(Integer, default=0)                  # 0/1
+
+    # Pre-qual fields (so AI can prep you)
+    dob = Column(String(20), nullable=True)                   # keep as string for now (safe)
+    state = Column(String(50), nullable=True)
+    smoker = Column(String(10), nullable=True)                # YES/NO/UNKNOWN
+    height = Column(String(20), nullable=True)
+    weight = Column(String(20), nullable=True)
+    health_notes = Column(Text, nullable=True)
+    desired_coverage = Column(String(50), nullable=True)      # e.g. 250k, 500k
+    monthly_budget = Column(String(50), nullable=True)
+    time_horizon = Column(String(50), nullable=True)          # ASAP/30days/just shopping
     call_status = Column(String(50), default="new")
     attempt_count = Column(Integer, default=0)
 
