@@ -10,8 +10,6 @@ import re
 from .ai_employee import run_ai_engine
 from ai_tasks import create_task
 
-
-
 # --------------------
 # DATABASE
 # --------------------
@@ -105,49 +103,67 @@ def dashboard():
 def lead_detail(lead_id: int, request: Request):
     db = SessionLocal()
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
-    tasks = db.query(Task).filter(Task.lead_id == lead_id).all()
     db.close()
 
     if not lead:
         return HTMLResponse("Lead not found", status_code=404)
 
-    task_rows = ""
-    for t in tasks:
-        task_rows += f"<li>{t.task_type} — {t.status}</li>"
-
     return HTMLResponse(f"""
-    <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+    <html>
+    <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+
       <h2>{lead.full_name}</h2>
+
       <p><b>Phone:</b> {lead.phone}</p>
       <p><b>Email:</b> {lead.email or "—"}</p>
       <p><b>Status:</b> {lead.state}</p>
 
-      <h3>Tasks</h3>
-      <ul>{task_rows}</ul>
+      <hr>
 
       <form method="post" action="/leads/{lead.id}/call">
-        <button>📞 CALL (Dry Run)</button>
+        <button style="padding:10px;margin:6px 0;">
+          📞 CALL (Dry Run)
+        </button>
       </form>
 
-      <br><a href="/tasks">← Back to Tasks</a>
-    </body></html>
+      <hr>
+
+      <h3>Escalate to Human</h3>
+
+      <form method="post" action="/leads/{lead.id}/escalate/now">
+        <button style="background:#dc2626;color:white;padding:10px;margin:6px 0;">
+          🔥 Wants Coverage NOW
+        </button>
+      </form>
+
+      <form method="post" action="/leads/{lead.id}/escalate/problem">
+        <button style="background:#f59e0b;color:black;padding:10px;margin:6px 0;">
+          ⚠️ Confused / Upset / Complicated
+        </button>
+      </form>
+
+      <br>
+      <a href="/tasks">← Back to Tasks</a>
+
+    </body>
+    </html>
     """)
 
 # ---------- CALL (DRY RUN) ----------
 @app.post("/leads/{lead_id}/call")
 def call_lead_dry_run(lead_id: int):
-    db = SessionLocal()
-    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+    create_task("CALL", lead_id)
+    return RedirectResponse(f"/leads/{lead_id}", status_code=303)
 
-    if lead:
-        db.add(Task(
-            lead_id=lead.id,
-            task_type="CALL",
-            status="DRY_RUN"
-        ))
-        db.commit()
+# ---------- ESCALATION ----------
+@app.post("/leads/{lead_id}/escalate/now")
+def escalate_now(lead_id: int):
+    create_task("ESCALATE_NOW", lead_id)
+    return RedirectResponse(f"/leads/{lead_id}", status_code=303)
 
-    db.close()
+@app.post("/leads/{lead_id}/escalate/problem")
+def escalate_problem(lead_id: int):
+    create_task("ESCALATE_PROBLEM", lead_id)
     return RedirectResponse(f"/leads/{lead_id}", status_code=303)
 
 # ---------- CSV UPLOAD ----------
@@ -200,15 +216,21 @@ def tasks():
         FROM ai_tasks t
         JOIN leads l ON l.id = t.lead_id
         WHERE t.status = 'NEW'
-        ORDER BY t.created_at
+        ORDER BY
+          CASE
+            WHEN t.task_type LIKE 'ESCALATE%' THEN 0
+            ELSE 1
+          END,
+          t.created_at
         LIMIT 50
     """)).fetchall()
     db.close()
 
     cards = ""
     for r in rows:
+        color = "#dc2626" if r.task_type.startswith("ESCALATE") else "#111827"
         cards += (
-            "<div class='card'>"
+            f"<div class='card' style='border-left:6px solid {color}'>"
             f"<b>{r.task_type}</b><br>"
             f"{r.full_name}<br>"
             f"{r.phone}<br>"
