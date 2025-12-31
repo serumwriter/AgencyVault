@@ -20,15 +20,17 @@ app = FastAPI(title="AgencyVault")
 # =========================
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # removes NUL + control chars (keeps \t\n\r)
 
-def clean_text(s):
-    if s is None:
+def clean_text(val):
+    """
+    Removes null bytes and non-printable characters
+    that Postgres refuses to store.
+    """
+    if not val:
         return None
-    if not isinstance(s, str):
-        s = str(s)
-    s = s.replace("\x00", "")
-    s = _CONTROL_RE.sub("", s)
-    s = s.strip()
-    return s or None
+    if not isinstance(val, str):
+        val = str(val)
+    return val.replace("\x00", "").strip()
+
 
 def normalize_phone(s):
     s = clean_text(s) or ""
@@ -212,32 +214,22 @@ def add_lead_manual(
 ):
     db = SessionLocal()
 
-    fn = clean_text(full_name) or "Unknown"
-    ph = normalize_phone(phone)
-    em = clean_text(email)
-    src = clean_text(source)
-
-    if not ph:
-        db.close()
-        return RedirectResponse("/dashboard", status_code=303)
-
-    if dedupe_exists(db, ph, em):
-        db.close()
-        return RedirectResponse("/dashboard", status_code=303)
-
     lead = Lead(
-        full_name=fn,
-        phone=ph,
-        email=em,
-        source=src,
+        full_name=clean_text(full_name) or "Unknown",
+        phone=normalize_phone(phone),
+        email=clean_text(email),
+        source=clean_text(source),
         status="New",
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
+
     db.add(lead)
     db.commit()
     db.close()
+
     return RedirectResponse("/dashboard", status_code=303)
+
 
 
 @app.post("/leads/upload")
@@ -252,35 +244,25 @@ def upload(file: UploadFile = File(...)):
     count = 0
     skipped_dupes = 0
 
-    for r in rows:
-        vals = [clean_text(c) for c in r]
-        vals = [v for v in vals if v]
+   for r in rows:
+    vals = [clean_text(c) for c in r if c and clean_text(c)]
+    name = next((v for v in vals if looks_like_name(v)), None)
+    phone = next((v for v in vals if looks_like_phone(v)), None)
+    email = next((v for v in vals if "@" in v), None)
 
-        name = next((v for v in vals if looks_like_name(v)), None)
-        phone = next((v for v in vals if looks_like_phone(v)), None)
-        email = next((v for v in vals if "@" in v), None)
-        source = next((v for v in vals if any(k in v.lower() for k in ["facebook", "tiktok", "instagram", "referral", "lead", "form"])), None)
+    if not phone:
+        continue
 
-        ph = normalize_phone(phone)
-        em = clean_text(email)
+    db.add(Lead(
+        full_name=name or "Unknown",
+        phone=normalize_phone(phone),
+        email=email,
+        status="New",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    ))
+    count += 1
 
-        if not ph:
-            continue
-
-        if dedupe_exists(db, ph, em):
-            skipped_dupes += 1
-            continue
-
-        db.add(Lead(
-            full_name=name or "Unknown",
-            phone=ph,
-            email=em,
-            source=source,
-            status="New",
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow(),
-        ))
-        count += 1
 
     db.commit()
     db.close()
@@ -368,14 +350,20 @@ def lead_detail(lead_id: int, request: Request):
 
 
 @app.post("/leads/{lead_id}/notes")
-def save_notes(lead_id: int, source: str = Form(""), notes: str = Form("")):
+def save_notes(
+    lead_id: int,
+    source: str = Form(""),
+    notes: str = Form("")
+):
     db = SessionLocal()
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
+
     if lead:
         lead.source = clean_text(source)
         lead.notes = clean_text(notes)
         lead.updated_at = datetime.utcnow()
         db.commit()
+
     db.close()
     return RedirectResponse(f"/leads/{lead_id}", status_code=303)
 
@@ -395,12 +383,11 @@ def save_prequal(
 ):
     db = SessionLocal()
     lead = db.query(Lead).filter(Lead.id == lead_id).first()
+
     if lead:
         lead.state = clean_text(state)
         lead.dob = clean_text(dob)
-        lead.smoker = (clean_text(smoker) or None)
-        if lead.smoker:
-            lead.smoker = lead.smoker.upper()
+        lead.smoker = clean_text(smoker)
         lead.height = clean_text(height)
         lead.weight = clean_text(weight)
         lead.desired_coverage = clean_text(desired_coverage)
@@ -409,6 +396,7 @@ def save_prequal(
         lead.health_notes = clean_text(health_notes)
         lead.updated_at = datetime.utcnow()
         db.commit()
+
     db.close()
     return RedirectResponse(f"/leads/{lead_id}", status_code=303)
 
