@@ -202,7 +202,16 @@ def ai_run():
     actions = run_ai_engine(db, Lead)
 
     for a in actions:
-        create_task(a["type"], a["lead_id"])
+    action_type = a["type"]
+
+    if action_type in ("CALL", "SUGGEST_CALL"):
+        create_task("CALL", a["lead_id"])
+
+    elif action_type.startswith("ESCALATE"):
+        create_task(action_type, a["lead_id"])
+
+    # ignore internal AI events like LEAD_TRIAGED
+
 
     db.close()
     return {"planned": len(actions)}
