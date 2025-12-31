@@ -7,7 +7,7 @@ import csv
 import os
 import re
 
-from ai_employee import run_ai_engine
+from .ai_employee import run_ai_engine
 from ai_tasks import create_task, Task
 
 # --------------------
