@@ -6,6 +6,23 @@ COOLDOWN_MINUTES = 15
 # ----------------------------
 # NORMALIZATION
 # ----------------------------
+def resolve_name(lead):
+    # 1. If name looks real, keep it
+    if lead.full_name:
+        name = lead.full_name.strip()
+        if len(name.split()) >= 2 and "lead" not in name.lower():
+            return name
+
+    # 2. Try email inference
+    if lead.email and "@" in lead.email:
+        local = lead.email.split("@")[0]
+        local = re.sub(r"[0-9_\.]+", " ", local)
+        parts = [p.capitalize() for p in local.split() if len(p) > 2]
+        if len(parts) >= 2:
+            return " ".join(parts[:2])
+
+    # 3. Fallback
+    return lead.full_name or "Unknown"
 def norm_phone(phone):
     if not phone:
         return None
