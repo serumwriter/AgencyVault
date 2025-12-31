@@ -19,36 +19,6 @@ app = FastAPI(title="AgencyVault")
 # SCHEMA SAFETY (POSTGRES ONLY – NO MIGRATIONS)
 # ============================================================
 
-def ensure_schema():
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS source TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS notes TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'New'"))
-
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS product_interest TEXT DEFAULT 'UNKNOWN'"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_confidence INTEGER"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_evidence TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS ai_summary TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS needs_human INTEGER DEFAULT 0"))
-
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS attempt_count INTEGER DEFAULT 0"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS last_contacted_at TIMESTAMP"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS next_followup_at TIMESTAMP"))
-
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS state TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS dob TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS smoker TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS height TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS weight TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS desired_coverage TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS monthly_budget TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS time_horizon TEXT"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS health_notes TEXT"))
-
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS do_not_contact INTEGER DEFAULT 0"))
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()"))
-
-ensure_schema()
 
 # ============================================================
 # HELPERS
