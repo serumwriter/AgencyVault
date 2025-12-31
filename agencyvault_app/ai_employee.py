@@ -107,7 +107,7 @@ def run_ai_engine(db, Lead, batch_size=25):
 
         product, prod_ev = detect_product(lead)
         urgent, urg_ev = detect_urgency(lead)
-       from datetime import timedelta
+from datetime import timedelta
 
        # when planning a CALL
        actions.append({
