@@ -221,7 +221,7 @@ mem = {
         .filter(LeadMemory.lead_id == lead.id)
         .all()
 }
-<h3>🧠 AI Lead Profile</h3>
+<h3> AI Lead Profile</h3>
 <ul>
   <li>State: {{ mem.get("state","—") }}</li>
   <li>Smoker: {{ mem.get("smoker","—") }}</li>
