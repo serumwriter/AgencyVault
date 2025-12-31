@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, text
 from sqlalchemy.orm import sessionmaker, declarative_base
@@ -7,8 +7,8 @@ import csv
 import os
 import re
 
-from ai_tasks import create_task
-from .ai_employee import run_ai_engine
+from ai_employee import run_ai_engine
+from ai_tasks import create_task, Task
 
 # --------------------
 # DATABASE
@@ -66,6 +66,7 @@ def looks_like_name(s):
 def root():
     return RedirectResponse("/dashboard")
 
+# ---------- DASHBOARD ----------
 @app.get("/dashboard")
 def dashboard():
     db = SessionLocal()
@@ -74,14 +75,13 @@ def dashboard():
 
     rows = ""
     for l in leads:
-        rows += (
-            "<div class='card'>"
-            f"<b>{l.full_name}</b><br>"
-            f"{l.phone}<br>"
-            f"State: {l.state}<br>"
-            f"Next: {l.ai_next_action or '-'}"
-            "</div>"
-        )
+        rows += f"""
+        <div class="card">
+          <b>{l.full_name}</b><br>
+          {l.phone}<br>
+          {l.email or ""}
+        </div>
+        """
 
     return HTMLResponse(
         "<html><head><style>"
@@ -98,6 +98,57 @@ def dashboard():
         "</body></html>"
     )
 
+# ---------- LEAD DETAIL ----------
+@app.get("/leads/{lead_id}", response_class=HTMLResponse)
+def lead_detail(lead_id: int, request: Request):
+    db = SessionLocal()
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+    tasks = db.query(Task).filter(Task.lead_id == lead_id).all()
+    db.close()
+
+    if not lead:
+        return HTMLResponse("Lead not found", status_code=404)
+
+    task_rows = ""
+    for t in tasks:
+        task_rows += f"<li>{t.task_type} — {t.status}</li>"
+
+    return HTMLResponse(f"""
+    <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+      <h2>{lead.full_name}</h2>
+      <p><b>Phone:</b> {lead.phone}</p>
+      <p><b>Email:</b> {lead.email or "—"}</p>
+      <p><b>Status:</b> {lead.state}</p>
+
+      <h3>Tasks</h3>
+      <ul>{task_rows}</ul>
+
+      <form method="post" action="/leads/{lead.id}/call">
+        <button>📞 CALL (Dry Run)</button>
+      </form>
+
+      <br><a href="/tasks">← Back to Tasks</a>
+    </body></html>
+    """)
+
+# ---------- CALL (DRY RUN) ----------
+@app.post("/leads/{lead_id}/call")
+def call_lead_dry_run(lead_id: int):
+    db = SessionLocal()
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+
+    if lead:
+        db.add(Task(
+            lead_id=lead.id,
+            task_type="CALL",
+            status="DRY_RUN"
+        ))
+        db.commit()
+
+    db.close()
+    return RedirectResponse(f"/leads/{lead_id}", status_code=303)
+
+# ---------- CSV UPLOAD ----------
 @app.post("/leads/upload")
 def upload(file: UploadFile = File(...)):
     raw = file.file.read().decode("utf-8", errors="ignore").splitlines()
@@ -123,8 +174,10 @@ def upload(file: UploadFile = File(...)):
 
     db.commit()
     db.close()
+
     return HTMLResponse(f"<h3>Imported {count}</h3><a href='/dashboard'>Back</a>")
 
+# ---------- AI PLAN ----------
 @app.get("/ai/run")
 def ai_run():
     db = SessionLocal()
@@ -136,14 +189,15 @@ def ai_run():
     db.close()
     return {"planned": len(actions)}
 
+# ---------- TASKS ----------
 @app.get("/tasks")
 def tasks():
     db = SessionLocal()
     rows = db.execute(text("""
-        SELECT t.task_type, l.full_name, l.phone
+        SELECT t.task_type, t.lead_id, l.full_name, l.phone
         FROM ai_tasks t
         JOIN leads l ON l.id = t.lead_id
-        WHERE t.status='NEW'
+        WHERE t.status = 'NEW'
         ORDER BY t.created_at
         LIMIT 50
     """)).fetchall()
@@ -155,7 +209,8 @@ def tasks():
             "<div class='card'>"
             f"<b>{r.task_type}</b><br>"
             f"{r.full_name}<br>"
-            f"{r.phone}"
+            f"{r.phone}<br>"
+            f"<a href='/leads/{r.lead_id}'>View Lead →</a>"
             "</div>"
         )
 
