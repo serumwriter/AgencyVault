@@ -1,11 +1,19 @@
 from datetime import datetime, timedelta
 import re
+from collections import defaultdict
 
+# =========================
+# CONFIG
+# =========================
+MAX_CALL_ATTEMPTS = 6
 COOLDOWN_MINUTES = 15
+DUPLICATE_PHONE_WEIGHT = 40
+DUPLICATE_EMAIL_WEIGHT = 30
+KEYWORD_WEIGHT = 15
 
-# ----------------------------
+# =========================
 # NORMALIZATION
-# ----------------------------
+# =========================
 def norm_phone(phone):
     if not phone:
         return None
@@ -14,20 +22,21 @@ def norm_phone(phone):
         return "+1" + d
     return d
 
-# ----------------------------
+def clean_text(*parts):
+    return " ".join(p for p in parts if p).lower()
+
+# =========================
 # NAME RESOLUTION (HUMAN-LIKE)
-# ----------------------------
+# =========================
 def resolve_name(lead):
-    # 1. Trust real-looking names
     if lead.full_name:
         name = lead.full_name.strip()
-        if (
-            len(name.split()) >= 2
-            and not any(bad in name.lower() for bad in ["lead", "life", "center", "insurance"])
+        if len(name.split()) >= 2 and not any(
+            bad in name.lower()
+            for bad in ["life", "insurance", "lead", "center"]
         ):
             return name
 
-    # 2. Infer from email
     if lead.email and "@" in lead.email:
         local = lead.email.split("@")[0]
         local = re.sub(r"[0-9_\.]+", " ", local)
@@ -35,112 +44,154 @@ def resolve_name(lead):
         if len(parts) >= 2:
             return " ".join(parts[:2])
 
-    # 3. Leave as-is if uncertain
     return lead.full_name or "Unknown"
 
-# ----------------------------
-# DEDUPE
-# ----------------------------
-def find_duplicate(db, Lead, lead):
-    phone = norm_phone(lead.phone)
-    if not phone:
-        return None
+# =========================
+# PRODUCT BRAIN (MAXED)
+# =========================
+def detect_product_and_value(lead):
+    text = clean_text(lead.source, lead.notes, lead.ai_summary)
 
-    return (
-        db.query(Lead)
-        .filter(Lead.phone == phone, Lead.id != lead.id)
-        .first()
-    )
+    evidence = []
+    score = 0
+    product = "LIFE"
 
-# ----------------------------
-# PRODUCT DETECTION
-# ----------------------------
-def detect_product(lead):
-    text = (lead.ai_reason or "").lower()
-
-    if any(k in text for k in ["annuity", "401k", "ira", "cd", "rollover"]):
-        return "ANNUITY"
+    if any(k in text for k in ["annuity", "ira", "401k", "rollover", "cd"]):
+        product = "ANNUITY"
+        score += 40
+        evidence.append("retirement / rollover language")
 
     if any(k in text for k in ["iul", "indexed", "cash value", "tax free"]):
-        return "IUL"
-
-    return "LIFE"
-
-# ----------------------------
-# PRIORITY SCORING
-# ----------------------------
-def score_priority(lead, product):
-    score = 10
-
-    if product == "ANNUITY":
-        score += 50
-    elif product == "IUL":
-        score += 35
-    else:
-        score += 20
-
-    if lead.ai_reason and any(
-        k in lead.ai_reason.lower()
-        for k in ["now", "today", "asap", "immediately"]
-    ):
+        product = "IUL"
         score += 30
+        evidence.append("cash value / indexed language")
 
-    return min(score, 100)
+    if any(k in text for k in ["term", "mortgage", "kids", "income"]):
+        evidence.append("income / family protection language")
 
-# ----------------------------
+    if any(k in text for k in ["now", "today", "asap", "ready"]):
+        score += 30
+        evidence.append("urgent intent")
+
+    return product, score, "; ".join(evidence) or "default life insurance assumptions"
+
+# =========================
+# DUPLICATE DETECTION
+# =========================
+def detect_duplicate(db, Lead, lead):
+    score = 0
+    evidence = []
+
+    if lead.phone:
+        dup = db.query(Lead).filter(
+            Lead.phone == lead.phone,
+            Lead.id != lead.id
+        ).first()
+        if dup:
+            score += DUPLICATE_PHONE_WEIGHT
+            evidence.append("duplicate phone")
+
+    if lead.email:
+        dup = db.query(Lead).filter(
+            Lead.email == lead.email,
+            Lead.id != lead.id
+        ).first()
+        if dup:
+            score += DUPLICATE_EMAIL_WEIGHT
+            evidence.append("duplicate email")
+
+    return score, "; ".join(evidence)
+
+# =========================
 # MAIN AI ENGINE
-# ----------------------------
+# =========================
 def run_ai_engine(db, Lead, batch_size=25):
     now = datetime.utcnow()
     actions = []
 
     leads = (
         db.query(Lead)
-        .filter(Lead.state == "NEW")
+        .filter(Lead.status == "New")
         .order_by(Lead.created_at.asc())
         .limit(batch_size)
         .all()
     )
 
     for lead in leads:
+        # -------------------------
+        # BASIC SANITY
+        # -------------------------
         if not lead.phone:
-            lead.state = "SKIPPED"
+            lead.status = "SKIPPED_NO_PHONE"
+            lead.ai_summary = "Skipped: no phone"
             continue
 
-        # Cooldown protection
-        if lead.ai_last_action_at:
-            if lead.ai_last_action_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
+        if lead.last_contacted_at:
+            if lead.last_contacted_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
                 continue
 
-        # Deduplication
-        if find_duplicate(db, Lead, lead):
-            lead.state = "DUPLICATE"
-            continue
-
-        # Resolve name like a human would
         lead.full_name = resolve_name(lead)
 
-        product = detect_product(lead)
-        score = score_priority(lead, product)
+        # -------------------------
+        # DUPLICATE CHECK
+        # -------------------------
+        dup_score, dup_evidence = detect_duplicate(db, Lead, lead)
+        if dup_score >= 40:
+            lead.status = "DUPLICATE"
+            lead.ai_confidence = 90
+            lead.ai_evidence = dup_evidence
+            lead.needs_human = 0
+            lead.ai_summary = "Duplicate lead detected"
+            continue
 
-        if score >= 80:
+        # -------------------------
+        # PRODUCT + VALUE BRAIN
+        # -------------------------
+        product, value_score, product_evidence = detect_product_and_value(lead)
+
+        confidence = min(100, value_score + 30)
+        needs_human = 0
+        action = "CALL"
+
+        # -------------------------
+        # ESCALATION RULES
+        # -------------------------
+        if product == "ANNUITY":
+            needs_human = 1
+            action = "ESCALATE_HIGH_VALUE"
+
+        elif product == "IUL":
+            needs_human = 1
+            action = "ESCALATE_STRATEGY"
+
+        if "urgent" in product_evidence:
+            needs_human = 1
             action = "ESCALATE_NOW"
-        elif score >= 40:
-            action = "CALL"
-        else:
-            action = "IGNORE"
+            confidence = max(confidence, 90)
 
-        lead.ai_priority = score
-        lead.ai_next_action = action
-        lead.ai_reason = f"{product} lead"
-        lead.ai_last_action_at = now
-        lead.state = "READY"
+        if confidence < 50:
+            action = "NEEDS_INFO"
 
-        if action in ("CALL", "ESCALATE_NOW"):
-            actions.append({
-                "type": action,
-                "lead_id": lead.id
-            })
+        # -------------------------
+        # WRITE MEMORY
+        # -------------------------
+        lead.product_interest = product
+        lead.ai_confidence = confidence
+        lead.ai_evidence = product_evidence
+        lead.needs_human = needs_human
+        lead.ai_summary = (
+            f"{product} | confidence {confidence} | {product_evidence}"
+        )
+        lead.last_contacted_at = now
+        lead.status = "AI_PROCESSED"
+
+        actions.append({
+            "type": action,
+            "lead_id": lead.id,
+            "confidence": confidence,
+            "evidence": product_evidence,
+            "needs_human": needs_human,
+        })
 
     db.commit()
     return actions
