@@ -3,8 +3,14 @@ import re
 
 COOLDOWN_MINUTES = 15
 
+
+# ============================================================
+# Helpers
+# ============================================================
+
 def clean_text(*parts):
     return " ".join([p for p in parts if p]).lower()
+
 
 def norm_phone(phone):
     if not phone:
@@ -12,13 +18,17 @@ def norm_phone(phone):
     d = re.sub(r"\D", "", phone)
     if len(d) == 10:
         return "+1" + d
-    return d
+    if len(d) == 11 and d.startswith("1"):
+        return "+" + d
+    return None
+
 
 def resolve_name(lead):
     if lead.full_name:
         name = lead.full_name.strip()
-        if len(name.split()) >= 2 and not any(
-            bad in name.lower() for bad in ["life", "insurance", "lead", "center"]
+        if (
+            len(name.split()) >= 2
+            and not any(bad in name.lower() for bad in ["life", "insurance", "lead", "center"])
         ):
             return name
 
@@ -31,8 +41,13 @@ def resolve_name(lead):
 
     return lead.full_name or "Unknown"
 
+
 def detect_product(lead):
-    t = clean_text(lead.source or "", lead.notes or "", lead.ai_summary or "")
+    t = clean_text(
+        getattr(lead, "source", ""),
+        getattr(lead, "notes", ""),
+        getattr(lead, "ai_summary", ""),
+    )
 
     if any(k in t for k in ["annuity", "ira", "401k", "rollover", "cd"]):
         return "ANNUITY", "retirement/rollover language"
@@ -42,33 +57,58 @@ def detect_product(lead):
 
     return "LIFE", "default life lane"
 
+
 def detect_urgency(lead):
-    t = clean_text(lead.notes or "", lead.ai_summary or "", lead.source or "")
+    t = clean_text(
+        getattr(lead, "notes", ""),
+        getattr(lead, "ai_summary", ""),
+        getattr(lead, "source", ""),
+    )
     if any(k in t for k in ["now", "today", "asap", "immediately", "right now", "ready"]):
         return True, "urgent intent language"
     return False, ""
 
+
 def missing_prequal_fields(lead):
     missing = []
-    if not lead.state: missing.append("state")
-    if not lead.dob: missing.append("dob")
-    if not lead.smoker: missing.append("smoker")
-    if not lead.height: missing.append("height")
-    if not lead.weight: missing.append("weight")
-    # health_notes can be empty; but if missing all of the above we still want it
+    if not getattr(lead, "state", None):
+        missing.append("state")
+    if not getattr(lead, "dob", None):
+        missing.append("dob")
+    if not getattr(lead, "smoker", None):
+        missing.append("smoker")
+    if not getattr(lead, "height", None):
+        missing.append("height")
+    if not getattr(lead, "weight", None):
+        missing.append("weight")
     return missing
 
+
 def dedupe(db, Lead, lead):
-    # strict dedupe: phone/email
     if lead.phone:
-        dup = db.query(Lead).filter(Lead.phone == lead.phone, Lead.id != lead.id).first()
+        dup = (
+            db.query(Lead)
+            .filter(Lead.phone == lead.phone, Lead.id != lead.id)
+            .first()
+        )
         if dup:
             return True, "duplicate phone"
+
     if lead.email:
-        dup = db.query(Lead).filter(Lead.email == lead.email, Lead.id != lead.id).first()
+        dup = (
+            db.query(Lead)
+            .filter(Lead.email == lead.email, Lead.id != lead.id)
+            .first()
+        )
         if dup:
             return True, "duplicate email"
+
     return False, ""
+
+
+# ============================================================
+# MAIN AI ENGINE
+# ============================================================
 
 def run_ai_engine(db, Lead, batch_size=25):
     now = datetime.utcnow()
@@ -83,18 +123,22 @@ def run_ai_engine(db, Lead, batch_size=25):
     )
 
     for lead in leads:
+        # Hard stop: no phone
         if not lead.phone:
             lead.status = "SKIPPED_NO_PHONE"
             lead.ai_summary = "Skipped: no phone"
             continue
 
-        # cooldown
-        if lead.last_contacted_at and lead.last_contacted_at + timedelta(minutes=COOLDOWN_MINUTES) > now:
+        # Cooldown protection
+        if (
+            lead.last_contacted_at
+            and lead.last_contacted_at + timedelta(minutes=COOLDOWN_MINUTES) > now
+        ):
             continue
 
         lead.full_name = resolve_name(lead)
 
-        # dedupe
+        # Dedupe check
         is_dup, dup_ev = dedupe(db, Lead, lead)
         if is_dup:
             lead.status = "DUPLICATE"
@@ -107,63 +151,51 @@ def run_ai_engine(db, Lead, batch_size=25):
 
         product, prod_ev = detect_product(lead)
         urgent, urg_ev = detect_urgency(lead)
-from datetime import timedelta
+        missing = missing_prequal_fields(lead)
 
-    # when planning a CALL
-actions.append({
-    "type": "TEXT",
-    "lead_id": lead.id,
-    "due_at": due_at - timedelta(minutes=7),
-    "payload": {
-        "message": f"Hi {lead.full_name.split()[0]}, this is a quick heads-up — I’ll be calling you shortly about your life insurance options."
-    }
-})
-
-missing = missing_prequal_fields(lead)
-
-
-        # base decision
+        # Base decision
         action = "CALL"
         needs_human = 0
         confidence = 55
         evidence = [prod_ev]
 
-        # product-based escalation
+        # Product-based escalation
         if product == "ANNUITY":
             action = "ESCALATE_HIGH_VALUE"
             needs_human = 1
             confidence = 85
-            evidence.append("annuity lane is high value / higher complexity")
+            evidence.append("annuity lane is high value")
 
         elif product == "IUL":
             action = "ESCALATE_STRATEGY"
             needs_human = 1
             confidence = 75
-            evidence.append("IUL strategy often needs experienced closer")
+            evidence.append("IUL strategy complexity")
 
-        # urgent intent overrides
+        # Urgency override
         if urgent:
             action = "ESCALATE_NOW"
             needs_human = 1
             confidence = max(confidence, 90)
             evidence.append(urg_ev)
 
-        # missing prequal fields → ask questions before wasting your time
+        # Missing info handling
         if missing and not urgent:
             action = "NEEDS_INFO"
             needs_human = 0
             confidence = 65
             evidence.append(f"missing prequal: {', '.join(missing)}")
 
-        # persist memory
+        # Persist AI state
         lead.product_interest = product
         lead.ai_confidence = confidence
-        lead.ai_evidence = "; ".join([e for e in evidence if e])
+        lead.ai_evidence = "; ".join(evidence)
         lead.needs_human = needs_human
         lead.ai_summary = f"{product} | conf {confidence} | {lead.ai_evidence}"
         lead.last_contacted_at = now
         lead.status = "AI_PROCESSED"
 
+        # CALL task
         actions.append({
             "type": action,
             "lead_id": lead.id,
@@ -171,6 +203,21 @@ missing = missing_prequal_fields(lead)
             "evidence": lead.ai_evidence,
             "needs_human": needs_human,
         })
+
+        # Pre-call TEXT (only if calling)
+        if action == "CALL":
+            actions.append({
+                "type": "TEXT",
+                "lead_id": lead.id,
+                "due_at": now + timedelta(minutes=5),
+                "payload": {
+                    "message": (
+                        f"Hi {lead.full_name.split()[0]}, "
+                        "this is a quick heads-up — I’ll be calling you shortly "
+                        "about your life insurance options."
+                    )
+                },
+            })
 
     db.commit()
     return actions
