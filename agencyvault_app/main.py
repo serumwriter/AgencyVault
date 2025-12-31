@@ -11,7 +11,7 @@ import json
 
 # ✅ PACKAGE-LOCAL IMPORTS (LOCKED — DO NOT CHANGE)
 from .database import SessionLocal, engine
-from .models import Lead
+from .models import Lead, LeadMemory
 
 # Existing app modules (keep as-is)
 from .ai_employee import run_ai_engine
