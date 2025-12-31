@@ -18,21 +18,6 @@ app = FastAPI(title="AgencyVault")
 # ============================================================
 # SCHEMA SAFETY (POSTGRES ONLY – NO MIGRATIONS)
 # ============================================================
-def clean_text(value: str | None) -> str | None:
-    """
-    Removes NULL bytes and unsafe characters that break Postgres.
-    Always use this before saving user / AI / CSV text.
-    """
-    if not value:
-        return None
-    if not isinstance(value, str):
-        value = str(value)
-
-    # Remove NUL bytes and control chars
-    value = value.replace("\x00", "")
-    value = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", value)
-
-    return value.strip() or None
 
 def ensure_schema():
     with engine.begin() as conn:
@@ -88,12 +73,21 @@ def dedupe_exists(db, phone, email):
         return True
     return False
 
-def clean_text(val):
-    if val is None:
+def clean_text(value: str | None) -> str | None:
+    """
+    Removes NULL bytes and unsafe characters that break Postgres.
+    Always use this before saving user / AI / CSV text.
+    """
+    if not value:
         return None
-    if not isinstance(val, str):
-        val = str(val)
-    return val.replace("\x00", "").strip() or None
+    if not isinstance(value, str):
+        value = str(value)
+
+    # Remove NUL bytes and control chars
+    value = value.replace("\x00", "")
+    value = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", value)
+
+    return value.strip() or None
 
 def base_styles():
     return """
