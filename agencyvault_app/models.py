@@ -37,6 +37,7 @@ class Lead(Base):
     dial_score: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    last_contacted_at = Column(DateTime, nullable=True)
 
     tasks: Mapped[list["Task"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
     actions: Mapped[list["Action"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
