@@ -1,4 +1,6 @@
 # agencyvault_app/main.py
+from .database import SessionLocal, engine
+from .models import Lead
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from sqlalchemy import text
