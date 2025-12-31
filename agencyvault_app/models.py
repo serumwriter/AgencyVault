@@ -13,7 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from database import Base
+from .database import Base
 
 # Keep enum-like values as strings (simple + migration-friendly)
 LEAD_STATES = ("NEW", "WORKING", "CONTACTED", "CLOSED", "DO_NOT_CONTACT")
