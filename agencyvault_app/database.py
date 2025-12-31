@@ -11,9 +11,11 @@ DATABASE_URL = _clean_database_url(os.getenv("DATABASE_URL"))
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing. Set it in Render environment variables.")
 
-# Render Postgres often uses postgres:// but SQLAlchemy prefers postgresql://
+# Force psycopg v3 driver (psycopg[binary])
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 class Base(DeclarativeBase):
     pass
