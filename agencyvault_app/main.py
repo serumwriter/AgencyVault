@@ -65,6 +65,9 @@ def mem_set(db, lead_id, key, value):
 
 def needs_human(db, lead_id):
     return (mem_get(db, lead_id, "needs_human") or "0") == "1"
+def learn(db, lead_id, key, value):
+    if value:
+        mem_set(db, lead_id, key, value)
 
 # ============================================================
 # BASIC ROUTES
