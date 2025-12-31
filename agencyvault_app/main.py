@@ -62,41 +62,140 @@ def looks_like_name(s):
 # --------------------
 # ROUTES
 # --------------------
+@app.post("/leads/manual")
+def add_lead_manual(
+    full_name: str = Form(""),
+    phone: str = Form(...),
+    email: str = Form("")
+):
+    db = SessionLocal()
+
+    lead = Lead(
+        full_name=full_name.strip() or None,
+        phone=phone.strip(),
+        email=email.strip() or None,
+        state="NEW"
+    )
+
+    db.add(lead)
+    db.commit()
+    db.close()
+
+    return RedirectResponse("/dashboard", status_code=303)
 @app.get("/")
 def root():
     return RedirectResponse("/dashboard")
 
 # ---------- DASHBOARD ----------
-@app.get("/dashboard")
+from fastapi import Form
+
+@app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db = SessionLocal()
     leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(50).all()
     db.close()
 
-    rows = ""
+    lead_cards = ""
     for l in leads:
-        rows += f"""
+        lead_cards += f"""
         <div class="card">
-          <b>{l.full_name}</b><br>
-          {l.phone}<br>
-          {l.email or ""}
+          <b>{l.full_name or "Unnamed Lead"}</b><br>
+          📞 {l.phone}<br>
+          ✉️ {l.email or "—"}<br>
+          <a href="/leads/{l.id}" class="link">View Lead →</a>
         </div>
         """
 
-    return HTMLResponse(
-        "<html><head><style>"
-        "body{background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px}"
-        ".card{background:#111827;padding:16px;margin:12px 0;border-radius:10px}"
-        "</style></head><body>"
-        "<h2>Leads</h2>"
-        "<form method='post' action='/leads/upload' enctype='multipart/form-data'>"
-        "<input type='file' name='file' required>"
-        "<button>Upload CSV</button>"
-        "</form>"
-        + rows +
-        "<br><a href='/tasks'>View Tasks</a>"
-        "</body></html>"
-    )
+    return HTMLResponse(f"""
+    <html>
+    <head>
+      <title>AgencyVault Dashboard</title>
+      <style>
+        body {{
+          background:#0b0f17;
+          color:#e6edf3;
+          font-family:system-ui;
+          padding:20px;
+        }}
+        h1 {{
+          font-size:32px;
+          margin-bottom:6px;
+        }}
+        .sub {{
+          opacity:0.8;
+          margin-bottom:24px;
+        }}
+        .card {{
+          background:#111827;
+          padding:16px;
+          margin:12px 0;
+          border-radius:10px;
+        }}
+        .box {{
+          background:#020617;
+          padding:20px;
+          border-radius:12px;
+          margin-bottom:24px;
+        }}
+        input, button {{
+          padding:10px;
+          margin:6px 0;
+          width:100%;
+          border-radius:6px;
+          border:none;
+        }}
+        button {{
+          background:#2563eb;
+          color:white;
+          font-weight:600;
+          cursor:pointer;
+        }}
+        .link {{
+          display:inline-block;
+          margin-top:8px;
+          color:#60a5fa;
+          text-decoration:none;
+        }}
+      </style>
+    </head>
+
+    <body>
+
+      <h1>AgencyVault</h1>
+      <div class="sub">Your AI insurance employee</div>
+
+      <!-- MANUAL ADD LEAD -->
+      <div class="box">
+        <h3>➕ Manually Add Lead</h3>
+        <form method="post" action="/leads/manual">
+          <input name="full_name" placeholder="Full Name" />
+          <input name="phone" placeholder="Phone Number" required />
+          <input name="email" placeholder="Email (optional)" />
+          <button>Add Lead</button>
+        </form>
+      </div>
+
+      <!-- UPLOAD CSV -->
+      <div class="box">
+        <h3>📤 Upload Leads (CSV)</h3>
+        <form method="post" action="/leads/upload" enctype="multipart/form-data">
+          <input type="file" name="file" required />
+          <button>Upload CSV</button>
+        </form>
+      </div>
+
+      <!-- CALL NOW -->
+      <div class="box">
+        <h3>📞 Call Now</h3>
+        <a class="link" href="/tasks">View Call Tasks →</a>
+      </div>
+
+      <h3>📋 Recent Leads</h3>
+      {lead_cards}
+
+    </body>
+    </html>
+    """)
 
 # ---------- LEAD DETAIL ----------
 @app.get("/leads/{lead_id}", response_class=HTMLResponse)
