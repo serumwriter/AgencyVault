@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from sqlalchemy import (
-    Column
+    Column,
     String,
     Integer,
     DateTime,
