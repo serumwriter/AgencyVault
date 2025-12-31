@@ -357,12 +357,31 @@ def escalate(lead_id: int):
 # ============================================================
 # AI + TASKS
 # ============================================================
+from datetime import datetime, timedelta
+
+BUSINESS_START = 9
+BUSINESS_END = 18
+MIN_GAP_MINUTES = 30
+
+
+def next_business_time(now: datetime) -> datetime:
+    t = now + timedelta(minutes=MIN_GAP_MINUTES)
+
+    if t.hour < BUSINESS_START:
+        t = t.replace(hour=BUSINESS_START, minute=0)
+    elif t.hour >= BUSINESS_END:
+        t = (t + timedelta(days=1)).replace(hour=BUSINESS_START, minute=0)
+
+    return t
+
+
 @app.get("/ai/run")
 def ai_run():
     """
-    Planning-mode AI: generate actions/tasks, escalate when needed.
-    Does NOT block request too long if your AI stays lightweight.
-    (We’ll move this to the worker soon; keeping for now because you use it.)
+    Planning-mode AI:
+    - Generates tasks with schedule
+    - Avoids re-planning same lead
+    - Escalates only when necessary
     """
     db = SessionLocal()
     try:
@@ -370,27 +389,59 @@ def ai_run():
 
         planned = 0
         escalations = 0
+        now = datetime.utcnow()
 
         for a in actions:
-            # expected: {"type": "...", "lead_id": 123, "needs_human": true/false, ...}
             t = a.get("type")
             lead_id = a.get("lead_id")
+
             if not t or not lead_id:
                 continue
 
-            create_task(t, lead_id)
+            # 🔒 Do not re-plan same action too often
+            last_plan = mem_get(db, lead_id, f"last_plan_{t}")
+            if last_plan:
+                try:
+                    last_plan_dt = datetime.fromisoformat(last_plan)
+                    if last_plan_dt + timedelta(hours=12) > now:
+                        continue
+                except Exception:
+                    pass
+
+            due_at = a.get("due_at") or next_business_time(now)
+
+            # ✅ Create scheduled task
+            create_task(
+                task_type=t,
+                lead_id=lead_id,
+                due_at=due_at
+            )
             planned += 1
 
+            # 🧠 Remember planning
+            mem_set(db, lead_id, f"last_plan_{t}", now.isoformat())
+
+            # 🚨 Escalation logic
             if a.get("needs_human"):
                 lead = db.query(Lead).filter(Lead.id == lead_id).first()
                 if lead:
                     mem_set(db, lead.id, "needs_human", "1")
-                    lead.updated_at = datetime.utcnow()
+                    lead.updated_at = now
                     escalations += 1
-                    send_alert_sms(f"🚨 AI NEEDS YOU\nLead: {lead.full_name}\n📞 {lead.phone}")
+
+                    send_alert_sms(
+                        f"🚨 AI NEEDS YOU\n"
+                        f"Lead: {lead.full_name}\n"
+                        f"📞 {lead.phone}"
+                    )
 
         db.commit()
-        return {"planned": planned, "escalations": escalations}
+        return {
+            "planned": planned,
+            "escalations": escalations,
+            "timestamp": now.isoformat()
+        }
+
     finally:
         db.close()
 
