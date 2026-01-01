@@ -14,6 +14,11 @@ from .models import Lead, LeadMemory, Task
 from .ai_employee import run_ai_engine
 from .twilio_client import send_alert_sms
 from ai_tasks import create_task
+from agencyvault_app.google_drive_import import (
+    import_google_sheet,
+    import_drive_csv,
+)
+import pandas as pd
 
 app = FastAPI(title="AgencyVault")
 
@@ -72,6 +77,47 @@ def learn(db, lead_id, key, value):
 # ============================================================
 # BASIC ROUTES
 # ============================================================
+@app.post("/import/google-drive")
+def import_from_google_drive(
+    file_id: str = Form(...),
+    file_type: str = Form(...),  # "sheet" or "csv"
+    creds_json: str = Form(...)
+):
+    db = SessionLocal()
+    try:
+        creds = json.loads(creds_json)
+
+        if file_type == "sheet":
+            df = import_google_sheet(creds, file_id)
+        else:
+            df = import_drive_csv(creds, file_id)
+
+        added = 0
+
+        for _, row in df.iterrows():
+            phone = normalize_phone(str(row.get("phone", "")))
+            email = clean_text(row.get("email"))
+            name = clean_text(row.get("name")) or "Unknown"
+
+            if not phone or dedupe_exists(db, phone, email):
+                continue
+
+            db.add(Lead(
+                full_name=name,
+                phone=phone,
+                email=email,
+                state="NEW",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            ))
+            added += 1
+
+        db.commit()
+        return {"imported": added}
+
+    finally:
+        db.close()
+
 @app.get("/")
 def root():
     return RedirectResponse("/dashboard")
