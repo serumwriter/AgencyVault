@@ -14,12 +14,13 @@ from .models import Lead, LeadMemory, Task
 from .ai_employee import run_ai_engine
 from .twilio_client import send_alert_sms
 from ai_tasks import create_task
-from agencyvault_app.google_drive_import import (
+import pandas as pd
+from .google_drive_import import (
     import_google_sheet,
     import_drive_csv,
 )
-import pandas as pd
-from agencyvault_app.image_import import (
+
+from .image_import import (
     extract_text_from_image,
     parse_leads_from_text,
 )
