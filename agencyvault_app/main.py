@@ -85,20 +85,29 @@ def learn(db, lead_id, key, value):
 # ============================================================
 # BASIC ROUTES
 # ============================================================
-@app.post("/import/image")
-async def import_from_image(file: UploadFile = File(...)):
+@app.post("/import/google-drive")
+def import_from_google_drive(
+    file_id: str = Form(...),
+    file_type: str = Form(...),  # "sheet" or "csv"
+    creds_json: str = Form(...)
+):
     db = SessionLocal()
     try:
-        raw = await file.read()
-        text = extract_text_from_image(io.BytesIO(raw))
-        leads = parse_leads_from_text(text)
+        creds = json.loads(creds_json)
+
+        if file_type == "sheet":
+            df = import_google_sheet(creds, file_id)
+        elif file_type == "csv":
+            df = import_drive_csv(creds, file_id)
+        else:
+            return {"error": "file_type must be 'sheet' or 'csv'"}
 
         added = 0
 
-        for l in leads:
-            phone = normalize_phone(l.get("phone"))
-            email = clean_text(l.get("email"))
-            name = clean_text(l.get("name")) or "Unknown"
+        for _, row in df.iterrows():
+            phone = normalize_phone(str(row.get("phone", "")))
+            email = clean_text(row.get("email"))
+            name = clean_text(row.get("name")) or "Unknown"
 
             if not phone or dedupe_exists(db, phone, email):
                 continue
@@ -119,6 +128,7 @@ async def import_from_image(file: UploadFile = File(...)):
     finally:
         db.close()
 
+
 @app.post("/import/google-drive")
 def import_from_google_drive(
     file_id: str = Form(...),
@@ -129,13 +139,12 @@ def import_from_google_drive(
     try:
         creds = json.loads(creds_json)
 
-      if file_type == "sheet":
-    df = import_google_sheet(creds, file_id)
-elif file_type == "csv":
-    df = import_drive_csv(creds, file_id)
-else:
-    return {"error": "file_type must be 'sheet' or 'csv'"}
-
+        if file_type == "sheet":
+            df = import_google_sheet(creds, file_id)
+        elif file_type == "csv":
+            df = import_drive_csv(creds, file_id)
+        else:
+            return {"error": "file_type must be 'sheet' or 'csv'"}
 
         added = 0
 
