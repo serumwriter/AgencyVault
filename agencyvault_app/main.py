@@ -189,3 +189,54 @@ def schedule():
         return HTMLResponse(f"<html><body>{rows or 'No tasks'}</body></html>")
     finally:
         db.close()
+# ============================================================
+# TASK EXECUTOR (TEXT auto-send)
+# ============================================================
+def _task_executor_loop():
+    while True:
+        try:
+            db = SessionLocal()
+            try:
+                # Fetch NEW text tasks that are due
+                rows = db.execute(text("""
+                    SELECT t.id, t.task_type, t.lead_id, t.notes
+                    FROM ai_tasks t
+                    WHERE t.status='NEW'
+                      AND t.task_type='TEXT'
+                      AND (t.due_at IS NULL OR t.due_at <= NOW())
+                    ORDER BY t.created_at
+                    LIMIT 10
+                """)).fetchall()
+
+                for r in rows:
+                    lead = db.query(Lead).filter(Lead.id == r.lead_id).first()
+                    if not lead or not lead.phone:
+                        db.execute(text(
+                            "UPDATE ai_tasks SET status='FAILED' WHERE id=:id"
+                        ), {"id": r.id})
+                        continue
+
+                    # Send SMS
+                    send_alert_sms(r.notes or f"Hi {lead.full_name}, just following up.")
+
+                    # Mark task done
+                    db.execute(text(
+                        "UPDATE ai_tasks SET status='DONE' WHERE id=:id"
+                    ), {"id": r.id})
+
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:
+            print("TASK EXECUTOR ERROR:", repr(e))
+
+        time.sleep(60)  # every 60 seconds
+
+
+@app.on_event("startup")
+def startup_task_executor():
+    if os.getenv("ENABLE_AUTORUN", "0") != "1":
+        return
+    t = threading.Thread(target=_task_executor_loop, daemon=True)
+    t.start()
+    print("Task executor started (TEXT auto-send).")
