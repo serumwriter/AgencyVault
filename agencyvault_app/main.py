@@ -1,4 +1,4 @@
-# agencyvault_app/main.py
+#agencyvault_app/main.py
 import io
 import json
 import time
@@ -273,27 +273,40 @@ def _task_executor_loop():
             db = SessionLocal()
             try:
                 rows = db.execute(text("""
-                    SELECT id, task_type, lead_id, notes
+                    SELECT id, task_type, lead_id
                     FROM ai_tasks
-                    WHERE status='NEW'
-                      AND task_type='TEXT'
-                      AND (due_at IS NULL OR due_at <= NOW())
+                    WHERE status = 'NEW'
+                      AND task_type = 'TEXT'
                     LIMIT 10
                 """)).fetchall()
 
                 for r in rows:
                     lead = db.query(Lead).filter_by(id=r.lead_id).first()
                     if not lead or not lead.phone:
+                        # Mark task done so it doesn't retry forever
+                        db.execute(
+                            text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
+                            {"id": r.id},
+                        )
                         continue
 
-                    send_alert_sms(r.notes or f"Hi {lead.full_name}, following up.")
-                    db.execute(text(
-                        "UPDATE ai_tasks SET status='DONE' WHERE id=:id"
-                    ), {"id": r.id})
+                    message = (
+                        f"Hi {lead.full_name.split()[0]}, "
+                        "just following up on your life insurance request."
+                    )
+
+                    send_alert_sms(message)
+
+                    db.execute(
+                        text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
+                        {"id": r.id},
+                    )
 
                 db.commit()
+
             finally:
                 db.close()
+
         except Exception as e:
             print("TASK EXECUTOR ERROR:", e)
 
