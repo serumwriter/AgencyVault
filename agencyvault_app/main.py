@@ -19,6 +19,10 @@ from agencyvault_app.google_drive_import import (
     import_drive_csv,
 )
 import pandas as pd
+from agencyvault_app.image_import import (
+    extract_text_from_image,
+    parse_leads_from_text,
+)
 
 app = FastAPI(title="AgencyVault")
 
@@ -77,6 +81,40 @@ def learn(db, lead_id, key, value):
 # ============================================================
 # BASIC ROUTES
 # ============================================================
+@app.post("/import/image")
+async def import_from_image(file: UploadFile = File(...)):
+    db = SessionLocal()
+    try:
+        raw = await file.read()
+        text = extract_text_from_image(io.BytesIO(raw))
+        leads = parse_leads_from_text(text)
+
+        added = 0
+
+        for l in leads:
+            phone = normalize_phone(l.get("phone"))
+            email = clean_text(l.get("email"))
+            name = clean_text(l.get("name")) or "Unknown"
+
+            if not phone or dedupe_exists(db, phone, email):
+                continue
+
+            db.add(Lead(
+                full_name=name,
+                phone=phone,
+                email=email,
+                state="NEW",
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            ))
+            added += 1
+
+        db.commit()
+        return {"imported": added}
+
+    finally:
+        db.close()
+
 @app.post("/import/google-drive")
 def import_from_google_drive(
     file_id: str = Form(...),
