@@ -1,5 +1,8 @@
 # agencyvault_app/main.py
-
+import io
+import json
+import time
+import threading
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from sqlalchemy import text
@@ -126,10 +129,13 @@ def import_from_google_drive(
     try:
         creds = json.loads(creds_json)
 
-        if file_type == "sheet":
-            df = import_google_sheet(creds, file_id)
-        else:
-            df = import_drive_csv(creds, file_id)
+      if file_type == "sheet":
+    df = import_google_sheet(creds, file_id)
+elif file_type == "csv":
+    df = import_drive_csv(creds, file_id)
+else:
+    return {"error": "file_type must be 'sheet' or 'csv'"}
+
 
         added = 0
 
