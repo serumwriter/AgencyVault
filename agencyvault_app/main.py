@@ -265,16 +265,14 @@ def ai_run():
     db = SessionLocal()
     try:
         actions = run_ai_engine(db, Lead) or []
-        created = 0
-
         for a in actions:
-            create_task(a["type"], a["lead_id"])
-            created += 1
-            if a.get("needs_human"):
-                mem_set(db, a["lead_id"], "needs_human", "1")
-
-        db.commit()
-        return {"planned_tasks": created}
+            create_task(
+                a["type"],
+                a["lead_id"],
+                notes=a.get("notes"),
+                due_at=a.get("due_at"),
+            )
+        return {"planned": len(actions)}
     finally:
         db.close()
 
