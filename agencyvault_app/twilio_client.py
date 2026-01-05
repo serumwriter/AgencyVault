@@ -52,3 +52,18 @@ def send_alert_sms(message: str):
         from_=from_number,
         to=to_number,
     )
+def send_lead_sms(to_number: str, message: str):
+    """
+    Sends an SMS directly to a lead.
+    """
+    if not to_number:
+        return
+
+    client = get_twilio_client()
+    from_number = get_from_number()
+
+    client.messages.create(
+        body=message,
+        from_=from_number,
+        to=to_number,
+    )
