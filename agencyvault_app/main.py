@@ -284,25 +284,43 @@ def schedule():
     db = SessionLocal()
     try:
         rows = db.execute(text("""
-            SELECT id, task_type, lead_id, notes, due_at, status
-            FROM ai_tasks
-            ORDER BY due_at NULLS FIRST
+            SELECT
+                t.id,
+                t.task_type,
+                t.lead_id,
+                t.due_at,
+                l.full_name,
+                l.phone,
+                l.email
+            FROM ai_tasks t
+            JOIN leads l ON l.id = t.lead_id
+            WHERE t.status = 'NEW'
+            ORDER BY t.due_at NULLS FIRST
             LIMIT 200
         """)).fetchall()
 
-        html = ""
+        html_rows = ""
+
         for r in rows:
-            html += f"""
-            <div style="padding:10px;border-bottom:1px solid #333">
-                <b>{r.task_type}</b> — {r.notes or ""}
-                <br>
-                <a href="/leads/{r.lead_id}">View Lead</a>
-                <br>
-                Due: {r.due_at or "now"}
+            html_rows += f"""
+            <div style="padding:10px;margin:8px 0;border:1px solid #333;border-radius:8px">
+              <b>{r.task_type}</b><br>
+              {r.full_name or "Unknown"}<br>
+              📞 {r.phone}<br>
+              ✉️ {r.email or "—"}<br>
+              <a href="/leads/{r.lead_id}">View Lead</a><br>
+              Due: {r.due_at or "now"}
             </div>
             """
 
-        return HTMLResponse(f"<html><body>{html or 'No tasks yet'}</body></html>")
+        return HTMLResponse(f"""
+        <html>
+        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+        <h2>Schedule</h2>
+        {html_rows or "<p>No tasks</p>"}
+        </body>
+        </html>
+        """)
     finally:
         db.close()
 
