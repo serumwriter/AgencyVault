@@ -1,17 +1,20 @@
-#agencyvault_app/main.py
+# agencyvault_app/main.py
+
 import io
 import json
-import time
-import threading
 import os
 import re
+import time
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from sqlalchemy import text
 
+# ============================================================
 # PACKAGE-LOCAL IMPORTS (LOCKED)
+# ============================================================
 from .database import SessionLocal, engine
 from .models import Lead, LeadMemory
 from .ai_employee import run_ai_engine
@@ -21,6 +24,9 @@ from .image_import import extract_text_from_image, parse_leads_from_text
 
 from ai_tasks import create_task
 
+# ============================================================
+# APP
+# ============================================================
 app = FastAPI(title="AgencyVault")
 
 # ============================================================
@@ -196,7 +202,7 @@ def dashboard():
 # ============================================================
 # LEAD DETAIL
 # ============================================================
-@app.get("/leads/{lead_id}", response_class=HTMLResponse)
+@app.get("/leads/{{lead_id}}", response_class=HTMLResponse)
 def lead_detail(lead_id: int):
     db = SessionLocal()
     try:
@@ -216,15 +222,8 @@ def lead_detail(lead_id: int):
         <h2>{lead.full_name}</h2>
         <p>{lead.phone}</p>
         <p>{lead.email or "—"}</p>
-
         <h3>AI Profile</h3>
-        <ul>
-          <li>State: {mem.get("state","—")}</li>
-          <li>Smoker: {mem.get("smoker","—")}</li>
-          <li>Medical: {mem.get("medical","—")}</li>
-          <li>Income: {mem.get("income","—")}</li>
-        </ul>
-
+        <pre>{json.dumps(mem, indent=2)}</pre>
         <a href="/dashboard">← Back</a>
         </body></html>
         """)
@@ -232,40 +231,64 @@ def lead_detail(lead_id: int):
         db.close()
 
 # ============================================================
-# AI RUN
+# AI RUN (PLANNER ONLY — SAFE FOR THOUSANDS)
 # ============================================================
 @app.get("/ai/run")
 def ai_run():
     db = SessionLocal()
     try:
         actions = run_ai_engine(db, Lead) or []
+        created = 0
+
         for a in actions:
             create_task(a["type"], a["lead_id"])
+            created += 1
             if a.get("needs_human"):
                 mem_set(db, a["lead_id"], "needs_human", "1")
+
         db.commit()
-        return {"planned": len(actions)}
+        return {"planned_tasks": created}
     finally:
         db.close()
 
 # ============================================================
-# SCHEDULE
+# SCHEDULE (SAFE, NO ORM, NO CRASH)
 # ============================================================
 @app.get("/schedule", response_class=HTMLResponse)
 def schedule():
     db = SessionLocal()
     try:
-        tasks = db.query(Task).order_by(Task.due_at).limit(30).all()
-        rows = "".join(
-            f"<div>{t.type} → <a href='/leads/{t.lead_id}'>Lead</a></div>"
-            for t in tasks
-        )
-        return HTMLResponse(f"<html><body>{rows or 'No tasks'}</body></html>")
+        rows = db.execute(text("""
+            SELECT id, task_type, lead_id, status, created_at
+            FROM ai_tasks
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)).fetchall()
+
+        html = "<h2>📅 Task Schedule</h2>"
+
+        if not rows:
+            html += "<p>No tasks yet</p>"
+        else:
+            html += "<ul>"
+            for r in rows:
+                html += (
+                    "<li>"
+                    f"<b>{r.task_type}</b> | "
+                    f"<a href='/leads/{r.lead_id}'>Lead #{r.lead_id}</a> | "
+                    f"{r.status} | "
+                    f"{r.created_at}"
+                    "</li>"
+                )
+            html += "</ul>"
+
+        html += "<br><a href='/dashboard'>← Back</a>"
+        return HTMLResponse(f"<html><body>{html}</body></html>")
     finally:
         db.close()
 
 # ============================================================
-# BACKGROUND TASK EXECUTOR
+# BACKGROUND TASK EXECUTOR (SAFE)
 # ============================================================
 def _task_executor_loop():
     while True:
@@ -275,27 +298,23 @@ def _task_executor_loop():
                 rows = db.execute(text("""
                     SELECT id, task_type, lead_id
                     FROM ai_tasks
-                    WHERE status = 'NEW'
-                      AND task_type = 'TEXT'
-                    LIMIT 10
+                    WHERE status='NEW'
+                      AND task_type='TEXT'
+                    LIMIT 25
                 """)).fetchall()
 
                 for r in rows:
                     lead = db.query(Lead).filter_by(id=r.lead_id).first()
                     if not lead or not lead.phone:
-                        # Mark task done so it doesn't retry forever
                         db.execute(
                             text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
                             {"id": r.id},
                         )
                         continue
 
-                    message = (
-                        f"Hi {lead.full_name.split()[0]}, "
-                        "just following up on your life insurance request."
+                    send_alert_sms(
+                        f"Hi {lead.full_name.split()[0]}, just following up on your request."
                     )
-
-                    send_alert_sms(message)
 
                     db.execute(
                         text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
@@ -303,7 +322,6 @@ def _task_executor_loop():
                     )
 
                 db.commit()
-
             finally:
                 db.close()
 
