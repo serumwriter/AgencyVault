@@ -23,7 +23,7 @@ from .twilio_client import send_alert_sms
 from .google_drive_import import import_google_sheet, import_drive_csv
 from .image_import import extract_text_from_image, parse_leads_from_text
 
-from ai_tasks import create_task
+from ai_tasks import create_task, log_event
 
 # ============================================================
 # APP
@@ -228,6 +228,17 @@ def lead_detail(lead_id: int):
             .filter(LeadMemory.lead_id == lead.id)
             .all()
         }
+        events = db.execute(text("""
+            SELECT event_type, message, created_at
+            FROM ai_events
+            WHERE lead_id = :lead_id
+            ORDER BY created_at DESC
+            LIMIT 50
+        """), {"lead_id": lead.id}).fetchall()
+
+        event_html = ""
+        for e in events:
+            event_html += f"<div style='padding:6px 0;border-bottom:1px solid #222'>{e.created_at} - <b>{e.event_type}</b> - {e.message or ''}</div>"
 
         return HTMLResponse(f"""
         <html><body style="background:#0b0f17;color:#e6edf3;padding:20px">
@@ -238,7 +249,9 @@ def lead_detail(lead_id: int):
         <pre>{json.dumps(mem, indent=2)}</pre>
         <a href="/dashboard">← Back</a>
         </body></html>
-        """)
+               <h3>Activity</h3>
+        {event_html or "<p>No activity yet</p>"}   
+    """)
     finally:
         db.close()
 
@@ -272,6 +285,11 @@ def ai_run():
                 notes=a.get("notes"),
                 due_at=a.get("due_at"),
             )
+            log_event(
+                a["lead_id"],
+                "TASK_PLANNED",
+                f"{a['type']} planned"
+            )
         return {"planned": len(actions)}
     finally:
         db.close()
@@ -288,36 +306,40 @@ def schedule():
                 t.id,
                 t.task_type,
                 t.lead_id,
+                t.status,
                 t.due_at,
+                t.notes,
                 l.full_name,
                 l.phone,
                 l.email
             FROM ai_tasks t
             JOIN leads l ON l.id = t.lead_id
-            WHERE t.status = 'NEW'
-            ORDER BY t.due_at NULLS FIRST
-            LIMIT 200
+            ORDER BY
+                CASE WHEN t.status='NEW' THEN 0 ELSE 1 END,
+                t.due_at NULLS FIRST,
+                t.id DESC
+            LIMIT 300
         """)).fetchall()
 
         html_rows = ""
-
         for r in rows:
             html_rows += f"""
-            <div style="padding:10px;margin:8px 0;border:1px solid #333;border-radius:8px">
-              <b>{r.task_type}</b><br>
+            <div style="padding:12px;margin:10px 0;border:1px solid #333;border-radius:10px;background:#0f1624">
+              <b>{r.task_type}</b> <span style="opacity:0.8">[{r.status}]</span><br>
               {r.full_name or "Unknown"}<br>
-              📞 {r.phone}<br>
-              ✉️ {r.email or "—"}<br>
-              <a href="/leads/{r.lead_id}">View Lead</a><br>
-              Due: {r.due_at or "now"}
+              Phone: {r.phone}<br>
+              Email: {r.email or "-"}<br>
+              Notes: {r.notes or "-"}<br>
+              Due: {r.due_at or "now"}<br>
+              <a href="/leads/{r.lead_id}">Open lead</a>
             </div>
             """
 
         return HTMLResponse(f"""
         <html>
         <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
-        <h2>Schedule</h2>
-        {html_rows or "<p>No tasks</p>"}
+          <h2>Schedule</h2>
+          {html_rows or "<p>No tasks</p>"}
         </body>
         </html>
         """)
