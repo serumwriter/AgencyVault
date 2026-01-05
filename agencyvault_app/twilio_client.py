@@ -2,6 +2,23 @@ import os
 from twilio.rest import Client
 
 
+def make_call_with_transcription(to_number: str, twiml_url: str, lead_id: int):
+    client = get_twilio_client()
+    from_number = get_from_number()
+
+    call = client.calls.create(
+        to=to_number,
+        from_=from_number,
+        url=twiml_url,
+        record=True,
+        recording_channels="dual",
+        recording_track="both",
+        recording_status_callback=os.environ.get("TWILIO_RECORDING_WEBHOOK"),
+        recording_status_callback_event=["completed"],
+        recording_status_callback_method="POST"
+    )
+
+    return call.sid
 def get_twilio_client() -> Client:
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
