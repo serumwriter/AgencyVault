@@ -89,6 +89,26 @@ def mem_set(db, lead_id, key, value):
 
 def needs_human(db, lead_id):
     return (mem_get(db, lead_id, "needs_human") or "0") == "1"
+BAD_NAME_WORDS = {
+    "lead", "bronze", "silver", "gold", "facebook",
+    "insurance", "prospect", "customer", "unknown", "test"
+}
+
+def safe_first_name(lead) -> str:
+    raw = (lead.full_name or "").strip()
+    if not raw:
+        return ""
+
+    first = raw.split()[0].lower()
+
+    if (
+        first in BAD_NAME_WORDS
+        or len(first) < 2
+        or any(c.isdigit() for c in first)
+    ):
+        return ""
+
+    return raw.split()[0].capitalize()
 
 # ============================================================
 # IMPORT ROUTES
