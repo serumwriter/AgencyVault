@@ -242,6 +242,21 @@ def lead_detail(lead_id: int):
     finally:
         db.close()
 
+@app.get("/debug/task-leads")
+def debug_task_leads():
+    db = SessionLocal()
+    try:
+        rows = db.execute(text("""
+            SELECT lead_id, COUNT(*) AS cnt
+            FROM ai_tasks
+            GROUP BY lead_id
+            ORDER BY lead_id DESC
+            LIMIT 20
+        """)).fetchall()
+        return [{"lead_id": r.lead_id, "count": r.cnt} for r in rows]
+    finally:
+        db.close()
+
 # ============================================================
 # AI RUN (PLANNER ONLY — SAFE FOR THOUSANDS)
 # ============================================================
