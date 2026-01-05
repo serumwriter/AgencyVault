@@ -85,12 +85,6 @@ class Lead(Base):
         nullable=False
     )
 
-    # Relationships
-    tasks: Mapped[list["Task"]] = relationship(
-        back_populates="lead",
-        cascade="all, delete-orphan"
-    )
-
     actions: Mapped[list["Action"]] = relationship(
         back_populates="lead",
         cascade="all, delete-orphan"
