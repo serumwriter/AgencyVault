@@ -15,21 +15,22 @@ def ensure_ai_tasks_table():
                 task_type TEXT NOT NULL,
                 lead_id INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'NEW',
+                due_at TIMESTAMP,
+                notes TEXT,
+                attempt INTEGER DEFAULT 1,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """))
 
-def create_task(task_type: str, lead_id: int):
+def create_task(task_type, lead_id, notes=None, due_at=None):
     ensure_ai_tasks_table()
     with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO ai_tasks (task_type, lead_id, status, created_at)
-                VALUES (:task_type, :lead_id, 'NEW', :created_at)
-            """),
-            {
-                "task_type": task_type,
-                "lead_id": lead_id,
-                "created_at": datetime.utcnow()
-            }
-        )
+        conn.execute(text("""
+            INSERT INTO ai_tasks (task_type, lead_id, notes, due_at)
+            VALUES (:task_type, :lead_id, :notes, :due_at)
+        """), {
+            "task_type": task_type,
+            "lead_id": lead_id,
+            "notes": notes,
+            "due_at": due_at
+        })
