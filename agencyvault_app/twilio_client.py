@@ -67,3 +67,12 @@ def send_lead_sms(to_number: str, message: str):
         from_=from_number,
         to=to_number,
     )
+def send_lead_sms(to_number: str, message: str):
+    client = get_twilio_client()
+    from_number = get_from_number()
+
+    client.messages.create(
+        body=message,
+        from_=from_number,
+        to=to_number,
+    )
