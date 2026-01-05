@@ -284,31 +284,25 @@ def schedule():
     db = SessionLocal()
     try:
         rows = db.execute(text("""
-            SELECT id, task_type, lead_id, status, created_at
+            SELECT id, task_type, lead_id, notes, due_at, status
             FROM ai_tasks
-            ORDER BY created_at DESC
-            LIMIT 100
+            ORDER BY due_at NULLS FIRST
+            LIMIT 200
         """)).fetchall()
 
-        html = "<h2>📅 Task Schedule</h2>"
+        html = ""
+        for r in rows:
+            html += f"""
+            <div style="padding:10px;border-bottom:1px solid #333">
+                <b>{r.task_type}</b> — {r.notes or ""}
+                <br>
+                <a href="/leads/{r.lead_id}">View Lead</a>
+                <br>
+                Due: {r.due_at or "now"}
+            </div>
+            """
 
-        if not rows:
-            html += "<p>No tasks yet</p>"
-        else:
-            html += "<ul>"
-            for r in rows:
-                html += (
-                    "<li>"
-                    f"<b>{r.task_type}</b> | "
-                    f"<a href='/leads/{r.lead_id}'>Lead #{r.lead_id}</a> | "
-                    f"{r.status} | "
-                    f"{r.created_at}"
-                    "</li>"
-                )
-            html += "</ul>"
-
-        html += "<br><a href='/dashboard'>← Back</a>"
-        return HTMLResponse(f"<html><body>{html}</body></html>")
+        return HTMLResponse(f"<html><body>{html or 'No tasks yet'}</body></html>")
     finally:
         db.close()
 
