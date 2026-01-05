@@ -8,6 +8,7 @@ import time
 import threading
 from datetime import datetime, timedelta
 
+from fastapi.responses import FileResponse
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from sqlalchemy import text
@@ -157,6 +158,17 @@ async def import_from_image(file: UploadFile = File(...)):
 # ============================================================
 # BASIC ROUTES
 # ============================================================
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse("app/static/sw.js")
+
+@app.get("/manifest.json")
+def manifest():
+    return FileResponse("app/static/manifest.json")
+
+@app.get("/static/icons/icon-192.png")
+def icon_192():
+    return FileResponse("app/static/icons/icon-192.png")
 @app.get("/")
 def root():
     return RedirectResponse("/dashboard")
