@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 # PACKAGE-LOCAL IMPORTS (LOCKED)
 from .database import SessionLocal, engine
-from .models import Lead, LeadMemory, Task
+from .models import Lead, LeadMemory,
 from .ai_employee import run_ai_engine
 from .twilio_client import send_alert_sms
 from .google_drive_import import import_google_sheet, import_drive_csv
