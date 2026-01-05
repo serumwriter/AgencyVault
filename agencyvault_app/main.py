@@ -677,3 +677,38 @@ def startup():
     if os.getenv("ENABLE_AUTORUN", "0").strip() == "1":
         threading.Thread(target=_task_executor_loop, daemon=True).start()
         print("Task executor started.")
+@app.post("/twilio/recording")
+async def twilio_recording_webhook(
+    RecordingSid: str = Form(...),
+    RecordingUrl: str = Form(...),
+    CallSid: str = Form(...),
+):
+    db = SessionLocal()
+    try:
+        # Ask Twilio for transcript
+        client = get_twilio_client()
+        recordings = client.recordings(RecordingSid).fetch()
+
+        if recordings.transcription_sid:
+            transcript = client.transcriptions(
+                recordings.transcription_sid
+            ).fetch()
+
+            # Save transcript
+            db.execute(text("""
+                INSERT INTO ai_events (lead_id, event_type, message)
+                VALUES (
+                    (SELECT lead_id FROM ai_tasks WHERE status='DONE' ORDER BY created_at DESC LIMIT 1),
+                    'CALL_TRANSCRIPT',
+                    :msg
+                )
+            """), {"msg": transcript.transcription_text})
+
+            db.commit()
+
+    except Exception as e:
+        print("TRANSCRIPTION ERROR:", e)
+    finally:
+        db.close()
+
+    return {"ok": True}
