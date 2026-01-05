@@ -202,7 +202,7 @@ def dashboard():
 # ============================================================
 # LEAD DETAIL
 # ============================================================
-@app.get("/leads/{{lead_id}}", response_class=HTMLResponse)
+@app.get("/leads/{lead_id}", response_class=HTMLResponse)
 def lead_detail(lead_id: int):
     db = SessionLocal()
     try:
