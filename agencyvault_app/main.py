@@ -360,6 +360,9 @@ def schedule():
 # ============================================================
 # BACKGROUND TASK EXECUTOR (SAFE)
 # ============================================================
+# ============================================================
+# BACKGROUND TASK EXECUTOR
+# ============================================================
 def _task_executor_loop():
     while True:
         try:
@@ -368,13 +371,16 @@ def _task_executor_loop():
                 rows = db.execute(text("""
                     SELECT id, task_type, lead_id
                     FROM ai_tasks
-                    WHERE status='NEW'
-                      AND task_type='TEXT'
+                    WHERE status = 'NEW'
+                      AND task_type = 'TEXT'
+                    ORDER BY id
                     LIMIT 25
                 """)).fetchall()
 
                 for r in rows:
                     lead = db.query(Lead).filter_by(id=r.lead_id).first()
+
+                    # If lead is missing or has no phone, mark task done
                     if not lead or not lead.phone:
                         db.execute(
                             text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
@@ -382,16 +388,30 @@ def _task_executor_loop():
                         )
                         continue
 
-                    send_alert_sms(
-                        f"Hi {lead.full_name.split()[0]}, just following up on your request."
+                    # Build message safely
+                    first_name = (
+                        lead.full_name.split()[0]
+                        if lead.full_name and " " in lead.full_name
+                        else (lead.full_name or "there")
                     )
 
+                    message = (
+                        f"Hi {first_name}, "
+                        "just following up on your life insurance request."
+                    )
+
+                    # Send SMS to the LEAD
+                    from .twilio_client import send_lead_sms
+                    send_lead_sms(lead.phone, message)
+
+                    # Mark task complete
                     db.execute(
                         text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
                         {"id": r.id},
                     )
 
                 db.commit()
+
             finally:
                 db.close()
 
@@ -400,13 +420,14 @@ def _task_executor_loop():
 
         time.sleep(60)
 
+
 @app.on_event("startup")
 def startup():
-    # Ensure logging tables exist
+    # Ensure AI event log table exists
     ensure_ai_events_table()
 
-    # Start background executor if enabled
+    # Start executor if enabled
     if os.getenv("ENABLE_AUTORUN") == "1":
         threading.Thread(target=_task_executor_loop, daemon=True).start()
         print("Task executor started.")
-        print("Task executor started.")
+
