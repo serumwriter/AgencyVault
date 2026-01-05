@@ -371,16 +371,14 @@ def _task_executor_loop():
                 rows = db.execute(text("""
                     SELECT id, task_type, lead_id
                     FROM ai_tasks
-                    WHERE status = 'NEW'
-                      AND task_type = 'TEXT'
-                    ORDER BY id
-                    LIMIT 25
+                    WHERE status='NEW'
+                      AND task_type='TEXT'
+                    ORDER BY created_at ASC
+                    LIMIT 10
                 """)).fetchall()
 
                 for r in rows:
                     lead = db.query(Lead).filter_by(id=r.lead_id).first()
-
-                    # If lead is missing or has no phone, mark task done
                     if not lead or not lead.phone:
                         db.execute(
                             text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
@@ -388,23 +386,14 @@ def _task_executor_loop():
                         )
                         continue
 
-                    # Build message safely
-                    first_name = (
-                        lead.full_name.split()[0]
-                        if lead.full_name and " " in lead.full_name
-                        else (lead.full_name or "there")
-                    )
-
                     message = (
-                        f"Hi {first_name}, "
-                        "just following up on your life insurance request."
+                        f"Hi {lead.full_name.split()[0]}, "
+                        "this is a quick follow-up about your life insurance request. "
+                        "I’ll be calling you shortly."
                     )
 
-                    # Send SMS to the LEAD
-                    from .twilio_client import send_lead_sms
                     send_lead_sms(lead.phone, message)
 
-                    # Mark task complete
                     db.execute(
                         text("UPDATE ai_tasks SET status='DONE' WHERE id=:id"),
                         {"id": r.id},
@@ -418,7 +407,7 @@ def _task_executor_loop():
         except Exception as e:
             print("TASK EXECUTOR ERROR:", e)
 
-        time.sleep(60)
+        time.sleep(90)  # throttle = safe for Twilio
 
 
 @app.on_event("startup")
