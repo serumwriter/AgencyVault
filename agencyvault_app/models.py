@@ -104,25 +104,6 @@ class Lead(Base):
     def __repr__(self) -> str:
         return f"<Lead id={self.id} name={self.full_name!r} phone={self.phone!r} state={self.state!r}>"
 
-class Task(Base):
-    __tablename__ = "tasks"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    lead_id: Mapped[int] = mapped_column(ForeignKey("leads.id", ondelete="CASCADE"), nullable=False, index=True)
-
-    type: Mapped[str] = mapped_column(String(30), default="CALL", nullable=False, index=True)
-    status: Mapped[str] = mapped_column(String(30), default="PENDING", nullable=False, index=True)
-
-    priority: Mapped[int] = mapped_column(Integer, default=50, nullable=False, index=True)  # 0=highest
-    due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
-
-    notes: Mapped[str] = mapped_column(Text, default="", nullable=False)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-
-    lead: Mapped["Lead"] = relationship(back_populates="tasks")
-
 
 class Action(Base):
     __tablename__ = "actions"
