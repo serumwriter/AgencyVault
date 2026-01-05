@@ -33,6 +33,17 @@ app = FastAPI(title="AgencyVault")
 # ============================================================
 # SANITIZATION
 # ============================================================
+def ensure_ai_events_table():
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_events (
+                id SERIAL PRIMARY KEY,
+                lead_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            );
+        """))
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 def clean_text(val):
@@ -390,7 +401,12 @@ def _task_executor_loop():
         time.sleep(60)
 
 @app.on_event("startup")
-def startup_task_executor():
+def startup():
+    # Ensure logging tables exist
+    ensure_ai_events_table()
+
+    # Start background executor if enabled
     if os.getenv("ENABLE_AUTORUN") == "1":
         threading.Thread(target=_task_executor_loop, daemon=True).start()
+        print("Task executor started.")
         print("Task executor started.")
