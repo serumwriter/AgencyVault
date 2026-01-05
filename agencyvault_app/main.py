@@ -400,25 +400,40 @@ def dashboard():
 def lead_detail(lead_id: int):
     db = SessionLocal()
     try:
-        ensure_tables()
+        ensure_ai_events_table()
 
         lead = db.query(Lead).filter_by(id=lead_id).first()
         if not lead:
             return HTMLResponse("Not found", status_code=404)
 
+        # ---- AI MEMORY ----
         mem = {
             m.key: m.value
-            for m in db.query(LeadMemory).filter(LeadMemory.lead_id == lead.id).all()
+            for m in db.query(LeadMemory)
+            .filter(LeadMemory.lead_id == lead.id)
+            .all()
         }
 
+        # ---- TASKS ----
         tasks = db.execute(text("""
-            SELECT id, task_type, status, due_at, notes, created_at
+            SELECT task_type, status, due_at, notes, created_at
             FROM ai_tasks
             WHERE lead_id = :lead_id
             ORDER BY created_at DESC
             LIMIT 50
         """), {"lead_id": lead.id}).fetchall()
 
+        task_html = ""
+        for t in tasks:
+            task_html += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #222">
+              <b>{t.task_type}</b> [{t.status}]<br>
+              Due: {t.due_at or "now"}<br>
+              {t.notes or ""}
+            </div>
+            """
+
+        # ---- EVENTS / TRANSCRIPTS ----
         events = db.execute(text("""
             SELECT event_type, message, created_at
             FROM ai_events
@@ -427,45 +442,55 @@ def lead_detail(lead_id: int):
             LIMIT 50
         """), {"lead_id": lead.id}).fetchall()
 
-        task_html = ""
-        for t in tasks:
-            task_html += (
-                "<div style='padding:8px 0;border-bottom:1px solid #222'>"
-                f"<b>{t.task_type}</b> <span style='opacity:0.8'>[{t.status}]</span>"
-                f"<div style='opacity:0.8;font-size:13px'>Due: {t.due_at or 'now'} | Created: {t.created_at}</div>"
-                f"<div style='opacity:0.9'>Notes: {t.notes or '-'}</div>"
-                "</div>"
-            )
-
         event_html = ""
         for e in events:
-            event_html += (
-                "<div style='padding:8px 0;border-bottom:1px solid #222'>"
-                f"<b>{e.event_type}</b> <span style='opacity:0.8;font-size:13px'>({e.created_at})</span>"
-                f"<div style='opacity:0.9'>{(e.message or '')}</div>"
-                "</div>"
-            )
+            if e.event_type == "CALL_TRANSCRIPT":
+                event_html += f"""
+                <div style="margin:12px 0;padding:12px;background:#0f172a;border-radius:8px">
+                    <b>📞 Call Transcript</b><br>
+                    <pre style="white-space:pre-wrap;font-size:14px;line-height:1.4">
+{e.message}
+                    </pre>
+                </div>
+                """
+            else:
+                event_html += f"""
+                <div style="padding:6px 0;border-bottom:1px solid #222;opacity:0.85">
+                    {e.created_at} — <b>{e.event_type}</b><br>
+                    {e.message or ""}
+                </div>
+                """
 
         return HTMLResponse(f"""
         <html>
-        <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+        </head>
         <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
           <a href="/dashboard">← Back</a>
+
           <h2 style="margin:10px 0 6px 0;">{lead.full_name or "Unknown"}</h2>
           <div>📞 {lead.phone or "—"}</div>
           <div>✉️ {lead.email or "—"}</div>
 
           <h3 style="margin-top:18px;">AI Memory</h3>
-          <pre style="background:#0f1624;padding:12px;border-radius:10px;overflow:auto">{json.dumps(mem, indent=2)}</pre>
+          <pre style="background:#0f1624;padding:12px;border-radius:10px;overflow:auto">
+{json.dumps(mem, indent=2)}
+          </pre>
 
           <h3 style="margin-top:18px;">Tasks</h3>
-          <div style="background:#0f1624;padding:12px;border-radius:10px">{task_html or "<div>No tasks yet</div>"}</div>
+          <div style="background:#0f1624;padding:12px;border-radius:10px">
+            {task_html or "<div>No tasks yet</div>"}
+          </div>
 
           <h3 style="margin-top:18px;">Activity</h3>
-          <div style="background:#0f1624;padding:12px;border-radius:10px">{event_html or "<div>No activity yet</div>"}</div>
+          <div style="background:#0f1624;padding:12px;border-radius:10px">
+            {event_html or "<div>No activity yet</div>"}
+          </div>
         </body>
         </html>
         """)
+
     finally:
         db.close()
 
