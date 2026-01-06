@@ -797,10 +797,6 @@ async function send() {{
 </html>
 """)
 
-
-</body>
-</html>
-        """)
     finally:
         db.close()
 
