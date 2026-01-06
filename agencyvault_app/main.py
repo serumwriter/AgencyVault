@@ -798,3 +798,48 @@ def twilio_sms_inbound(
         return Response(content="<Response></Response>", media_type="text/xml")
     finally:
         db.close()
+# ============================================================
+# ADMIN — MASS DELETE (SAFE, EXPLICIT)
+# ============================================================
+
+@app.get("/admin/delete-all-leads", response_class=HTMLResponse)
+def admin_delete_all_leads_page():
+    return HTMLResponse("""
+    <html>
+      <body style="font-family:system-ui;background:#0b0f17;color:#e6edf3;padding:40px">
+        <h2>⚠️ Delete ALL Leads</h2>
+        <p>This will permanently delete:</p>
+        <ul>
+          <li>All leads</li>
+          <li>All AI actions</li>
+          <li>All AI memory</li>
+        </ul>
+
+        <form method="post" action="/admin/delete-all-leads">
+          <p>Type <b>DELETE ALL LEADS</b> to confirm:</p>
+          <input name="confirm" style="padding:8px;width:300px" />
+          <br><br>
+          <button style="background:#b91c1c;color:white;padding:10px 18px">
+            Permanently Delete Everything
+          </button>
+        </form>
+      </body>
+    </html>
+    """)
+
+
+@app.post("/admin/delete-all-leads")
+def admin_delete_all_leads(confirm: str = Form(...)):
+    if confirm.strip() != "DELETE ALL LEADS":
+        return {"error": "Confirmation text does not match"}
+
+    db = SessionLocal()
+    try:
+        # Order matters because of foreign keys
+        db.execute(text("DELETE FROM actions"))
+        db.execute(text("DELETE FROM lead_memory"))
+        db.execute(text("DELETE FROM leads"))
+        db.commit()
+        return {"ok": True, "message": "All leads and related data deleted"}
+    finally:
+        db.close()
