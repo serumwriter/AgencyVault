@@ -1,43 +1,15 @@
-"""
-Image OCR import helpers for AgencyVault.
-
-This module extracts text from uploaded images
-and converts it into structured lead rows.
-"""
-
 from typing import List, Dict
 import re
+import io
 from PIL import Image
 import pytesseract
 
-
-# ============================================================
-# OCR
-# ============================================================
-
-def extract_text_from_image(image: Image.Image) -> str:
-    """
-    Run OCR on a PIL Image and return extracted text.
-    """
-    return pytesseract.image_to_string(image)
-
-
-# ============================================================
-# LEAD PARSING
-# ============================================================
+def extract_text_from_image_bytes(data: bytes) -> str:
+    img = Image.open(io.BytesIO(data))
+    return pytesseract.image_to_string(img)
 
 def parse_leads_from_text(text: str) -> List[Dict[str, str]]:
-    """
-    Parse OCR text into lead dictionaries.
-
-    Expected formats (flexible):
-    - Name, Phone, Email
-    - Name Phone Email
-    - Line-by-line blocks
-    """
-
     leads: List[Dict[str, str]] = []
-
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     buffer: Dict[str, str] = {}
 
