@@ -18,6 +18,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from .database import engine, SessionLocal
 from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message
+from .image_import import extract_text_from_pdf_bytes
 from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
 from .image_import import extract_text_from_image_bytes, parse_leads_from_text
 from .twilio_client import (
