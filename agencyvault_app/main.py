@@ -1082,7 +1082,18 @@ def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = For
                 status_code=409
             )
 
-        db.add(Lead(full_name=n, phone=p, email=e, state="NEW", created_at=_now(), updated_at=_now()))
+        tz = infer_timezone_from_phone(phone)
+
+    db.add(Lead(
+        full_name=name,
+        phone=phone,
+        email=email,
+        state="NEW",          # workflow state
+        timezone=tz,          # derived from phone
+        created_at=_now(),
+        updated_at=_now()
+    ))
+
         _log(db, None, None, "LEAD_CREATED", f"{n} {p}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
