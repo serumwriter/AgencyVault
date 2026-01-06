@@ -1071,32 +1071,40 @@ def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = For
         p = normalize_phone(phone)
         e = clean_text(email)
         n = clean_text(full_name) or "Unknown"
+
         if not p:
             return HTMLResponse(
-                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Invalid phone. Use 10 digits like 4065551234.</div>",
+                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>"
+                "Invalid phone. Use 10 digits like 4065551234."
+                "</div>",
                 status_code=400
             )
+
         if dedupe_exists(db, p, e):
             return HTMLResponse(
-                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Lead already exists (duplicate phone/email).</div>",
+                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>"
+                "Lead already exists (duplicate phone/email)."
+                "</div>",
                 status_code=409
             )
 
-        tz = infer_timezone_from_phone(phone)
+        tz = infer_timezone_from_phone(p)
 
-    db.add(Lead(
-        full_name=name,
-        phone=phone,
-        email=email,
-        state="NEW",          # workflow state
-        timezone=tz,          # derived from phone
-        created_at=_now(),
-        updated_at=_now()
-    ))
+        db.add(Lead(
+            full_name=n,
+            phone=p,
+            email=e,
+            state="NEW",          # workflow state
+            timezone=tz,          # derived from phone
+            created_at=_now(),
+            updated_at=_now(),
+        ))
 
         _log(db, None, None, "LEAD_CREATED", f"{n} {p}")
         db.commit()
+
         return RedirectResponse("/dashboard", status_code=303)
+
     finally:
         db.close()
 
