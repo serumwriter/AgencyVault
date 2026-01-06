@@ -997,7 +997,7 @@ def import_drive_image(
 def leads_new_form():
     return HTMLResponse("""
     <html><body style="font-family:system-ui;padding:24px;background:#0b0f17;color:#e6edf3;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
       <h2 style="margin-top:12px;">➕ Add Lead</h2>
       <form method="post" action="/leads/new" style="margin-top:14px;">
         <div style="opacity:.8">Full Name</div>
@@ -1068,7 +1068,7 @@ def leads_list(search: str = "", state: str = ""):
 
         return HTMLResponse(f"""
         <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-          <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+          <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
           <h2 style="margin-top:12px;">📇 All Leads</h2>
 
           <form method="get" action="/leads" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
@@ -1155,7 +1155,7 @@ def lead_detail(lead_id: int):
 <!doctype html>
 <html><head><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Lead #{lead.id}</title></head>
 <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-<a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+<a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
 <h1 style="margin:14px 0 6px 0">#{lead.id} · {lead.full_name or "Unknown"}</h1>
 <div style="display:flex;gap:18px;flex-wrap:wrap;opacity:.92">
   <div>📞 <b>{lead.phone or "—"}</b></div>
@@ -1216,7 +1216,7 @@ def actions_page():
             """
         return HTMLResponse(f"""
         <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
         <h2 style="margin-top:12px;">✅ Action Queue</h2>
         <div style="background:#0f1624;padding:14px;border-radius:16px;border:1px solid rgba(50,74,110,.25)">{rows or "No actions"}</div>
         </body></html>
@@ -1239,7 +1239,7 @@ def activity():
             """
         return HTMLResponse(f"""
         <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
         <h2 style="margin-top:12px;">🧾 Activity</h2>
         <div style="background:#0f1624;padding:14px;border-radius:16px;border:1px solid rgba(50,74,110,.25)">{rows or "No activity"}</div>
         </body></html>
@@ -1254,7 +1254,7 @@ def activity():
 def admin_page():
     return HTMLResponse("""
     <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
       <h2 style="margin-top:12px;">🛡️ Admin</h2>
       <div style="opacity:.8;margin-bottom:14px">
         Dangerous actions require <b>ADMIN_TOKEN</b>. Use query param: <b>?token=YOUR_ADMIN_TOKEN</b>
@@ -1349,7 +1349,7 @@ def uploads_page():
     return HTMLResponse("""
     <html>
     <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:24px;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
       <h2>⬆️ Upload Leads</h2>
 
       <hr style="opacity:.2">
