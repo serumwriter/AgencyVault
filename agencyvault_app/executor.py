@@ -75,6 +75,7 @@ def run_executor_loop():
     sleep_s = int((os.getenv("EXECUTOR_SLEEP_SECONDS") or "30").strip())
 
     while True:
+        print("WORKER IS RUNNING", datetime.utcnow())
         db = SessionLocal()
         run = None
 
