@@ -764,22 +764,22 @@ def dashboard():
 </div>
 
 <script>
-async function send() {
+async function send() {{
   const msg = document.getElementById("cmd").value;
   const out = document.getElementById("out");
   out.textContent = "Thinking...";
-  try {
-    const r = await fetch("/api/assistant", {
+  try {{
+    const r = await fetch("/api/assistant", {{
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg })
-    });
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ message: msg }})
+    }});
     const d = await r.json();
     out.textContent = d.reply || "OK";
-  } catch (e) {
+  }} catch (e) {{
     out.textContent = "Error: " + e;
-  }
-}
+  }}
+}}
 </script>
 </body>
 </html>
