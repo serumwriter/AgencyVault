@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-set -o errexit
-set -o nounset
-set -o pipefail
+set -euo pipefail
 
-export PYTHONPATH=/opt/render/project/src
+export PYTHONUNBUFFERED=1
 
-exec uvicorn agencyvault_app.main:app \
-  --host 0.0.0.0 \
-  --port "${PORT:-8000}"
+if [[ "${WORKER:-0}" == "1" ]]; then
+  python -c "from agencyvault_app.executor import run_executor_loop; run_executor_loop()"
+else
+  uvicorn agencyvault_app.main:app --host 0.0.0.0 --port "${PORT:-10000}"
+fi
