@@ -998,7 +998,7 @@ def leads_new_form():
     return HTMLResponse("""
     <html><body style="font-family:system-ui;padding:24px;background:#0b0f17;color:#e6edf3;max-width:900px;margin:0 auto;">
       <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
-      <h2 style="margin-top:12px;">➕ Add Lead</h2>
+      <h2 style="margin-top:12px;">Add Lead</h2>
       <form method="post" action="/leads/new" style="margin-top:14px;">
         <div style="opacity:.8">Full Name</div>
         <input name="full_name" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
