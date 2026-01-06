@@ -94,15 +94,17 @@ def run_executor_loop():
             db.commit()
 
             actions = (
-                db.query(Action)
-                .filter(Action.status == "PENDING")
-                .order_by(Action.created_at.asc())
-                .limit(20)
-                .all()
-            )
-             print("PENDING ACTIONS FOUND:", len(actions))
+    db.query(Action)
+    .filter(Action.status == "PENDING")
+    .order_by(Action.created_at.asc())
+    .limit(20)
+    .all()
+)
 
-            executed = 0
+print("PENDING ACTIONS FOUND:", len(actions))
+
+executed = 0
+
 
             for a in actions:
                 try:
