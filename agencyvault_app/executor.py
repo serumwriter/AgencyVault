@@ -8,6 +8,17 @@ from .database import SessionLocal
 from .models import Action, Lead, AgentRun, AuditLog, Message
 from .twilio_client import send_lead_sms, make_call_with_recording
 
+from datetime import datetime
+import pytz
+
+def allowed_to_contact(lead) -> bool:
+    if not lead.timezone:
+        return False
+
+    tz = pytz.timezone(lead.timezone)
+    local_hour = datetime.now(tz).hour
+
+    return 8 <= local_hour < 21
 def _now():
     return datetime.utcnow()
 
