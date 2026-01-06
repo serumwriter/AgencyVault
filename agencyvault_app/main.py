@@ -913,7 +913,7 @@ async def import_image(file: UploadFile = File(...)):
     try:
         data = await file.read()
         text_data = extract_text_from_image_bytes(data)
-        leads = parse_leads_from_text(text_data)
+        leads = normalize_to_leads(text)
         added = 0
         for l in leads:
             if _import_row(db, l):
@@ -1028,7 +1028,7 @@ def import_doc(
             )
 
         text_data = import_google_doc_text(creds, file_id)
-        leads = parse_leads_from_text(text_data)
+        leads = normalize_to_leads(text)
         added = 0
         for l in leads:
             if _import_row(db, l):
@@ -1058,7 +1058,7 @@ def import_drive_image(
 
         img_bytes = drive_download_bytes(creds, file_id)
         text_data = extract_text_from_image_bytes(img_bytes)
-        leads = parse_leads_from_text(text_data)
+        leads = normalize_to_leads(text)
         added = 0
         for l in leads:
             if _import_row(db, l):
