@@ -2,9 +2,9 @@ import json
 import os
 import time
 from datetime import datetime
-from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
+from sqlalchemy.orm import Session
 
 from .database import SessionLocal
 from .models import Action, Lead, AgentRun, AuditLog, Message
@@ -19,13 +19,13 @@ def _now():
     return datetime.utcnow()
 
 
-def _log(db: Session, run_id: int | None, lead_id: int | None, event: str, detail: str):
+def _log(db: Session, run_id, lead_id, event, detail):
     db.add(AuditLog(
         run_id=run_id,
         lead_id=lead_id,
         event=event,
         detail=(detail or "")[:5000],
-        created_at=_now()
+        created_at=_now(),
     ))
 
 
@@ -48,13 +48,13 @@ def _due_ok(payload: dict) -> bool:
 
 
 # =========================
-# Compliance: Timezone Rules
+# Compliance
 # =========================
 
 def allowed_to_contact(lead: Lead) -> bool:
     """
-    Enforces 8am–9pm LOCAL TIME using Python built-in timezones.
-    If timezone is missing or invalid → DO NOT CONTACT.
+    Enforce 8am–9pm LOCAL TIME.
+    If timezone missing or invalid → DO NOT CONTACT.
     """
     if not lead.timezone:
         return False
@@ -64,27 +64,30 @@ def allowed_to_contact(lead: Lead) -> bool:
     except Exception:
         return False
 
-    local_hour = datetime.now(tz).hour
-    return 8 <= local_hour < 21
+    hour = datetime.now(tz).hour
+    return 8 <= hour < 21
+
 
 # =========================
 # Executor Loop
 # =========================
 
 def run_executor_loop():
-    sleep_s = int((os.getenv("EXECUTOR_SLEEP_SECONDS") or "30").strip())
+    sleep_s = int(os.getenv("EXECUTOR_SLEEP_SECONDS", "30"))
 
     while True:
         print("WORKER IS RUNNING", datetime.utcnow())
+
         db = SessionLocal()
         run = None
 
         try:
+            # ---- start run record
             run = AgentRun(
                 mode="execution",
                 status="STARTED",
                 batch_size=0,
-                notes="Executor tick"
+                notes="Executor tick",
             )
             db.add(run)
             db.commit()
@@ -93,19 +96,20 @@ def run_executor_loop():
             _log(db, run.id, None, "EXECUTOR_TICK", "Scanning for pending actions")
             db.commit()
 
+            # ---- fetch actions
             actions = (
-    db.query(Action)
-    .filter(Action.status == "PENDING")
-    .order_by(Action.created_at.asc())
-    .limit(20)
-    .all()
-)
+                db.query(Action)
+                .filter(Action.status == "PENDING")
+                .order_by(Action.created_at.asc())
+                .limit(20)
+                .all()
+            )
 
-print("PENDING ACTIONS FOUND:", len(actions))
+            print("PENDING ACTIONS FOUND:", len(actions))
 
-executed = 0
+            executed = 0
 
-
+            # ---- process actions
             for a in actions:
                 try:
                     payload = _parse_payload(a.payload_json)
@@ -130,7 +134,6 @@ executed = 0
                         db.commit()
                         continue
 
-                    # Timezone enforcement
                     if not allowed_to_contact(lead):
                         a.status = "SKIPPED"
                         a.error = "Outside allowed local time window"
@@ -143,27 +146,17 @@ executed = 0
                     a.started_at = _now()
                     db.commit()
 
-                    first_name = (lead.full_name or "there").split(" ")[0].strip()
+                    first_name = (lead.full_name or "there").split(" ")[0]
 
-                    # =========================
-                    # TEXT MESSAGE
-                    # =========================
+                    # ---- TEXT
                     if a.type == "TEXT":
+                        msg = (
+                            f"Hi {first_name}, this is Nick's office. "
+                            "You requested life insurance info. "
+                            "Want me to send you a quick quote?"
+                        )
 
-                        if lead.last_contacted_at:
-                            # Aged lead
-                            msg = (
-                                f"Hi {first_name}, this is Nick's office. "
-                                "You had requested life insurance info before. "
-                                "Do you still want help with a quick quote?"
-                            )
-                        else:
-                            # Fresh lead
-                            msg = (
-                                f"Hi {first_name}, this is Nick's office. "
-                                "You recently requested life insurance information. "
-                                "I can get you a quick quote — want me to send it?"
-                            )
+                        print("SENDING SMS TO", lead.phone)
 
                         sid = send_lead_sms(lead.phone, msg)
 
@@ -175,41 +168,38 @@ executed = 0
                             to_number=lead.phone,
                             body=msg,
                             provider_sid=sid or "",
-                            created_at=_now()
+                            created_at=_now(),
                         ))
 
                         _log(db, run.id, lead.id, "TEXT_SENT", msg)
 
-                    # =========================
-                    # PHONE CALL
-                    # =========================
+                    # ---- CALL
                     elif a.type == "CALL":
+                        print("CALLING", lead.phone)
 
-                        call_script = (
+                        script = (
                             f"Hi {first_name}. This is Nick calling about the life "
-                            "insurance information you requested. I just need to ask "
-                            "you a couple quick questions so I can get you accurate pricing. "
-                            "If now is not a good time, you can hang up or text me back. "
-                            "Otherwise, stay on the line."
+                            "insurance information you requested. "
+                            "If now is not a good time, you can hang up or text me back."
                         )
 
                         sid = make_call_with_recording(
                             to=lead.phone,
                             lead_id=lead.id,
-                            script=call_script
+                            script=script,
                         )
 
                         _log(db, run.id, lead.id, "CALL_STARTED", f"sid={sid}")
 
                     else:
                         a.status = "SKIPPED"
-                        a.error = f"Unknown action type: {a.type}"
+                        a.error = f"Unknown action type {a.type}"
                         a.finished_at = _now()
                         _log(db, run.id, lead.id, "ACTION_SKIPPED_UNKNOWN", a.error)
                         db.commit()
                         continue
 
-                    # Success bookkeeping
+                    # ---- success
                     lead.last_contacted_at = _now()
                     lead.updated_at = _now()
 
