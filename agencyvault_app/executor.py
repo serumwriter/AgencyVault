@@ -53,20 +53,19 @@ def _due_ok(payload: dict) -> bool:
 
 def allowed_to_contact(lead: Lead) -> bool:
     """
-    Enforces 8am–9pm LOCAL TIME.
-    If timezone is unknown → DO NOT CONTACT.
+    Enforces 8am–9pm LOCAL TIME using Python built-in timezones.
+    If timezone is missing or invalid → DO NOT CONTACT.
     """
     if not lead.timezone:
         return False
 
     try:
-        tz = pytz.timezone(lead.timezone)
+        tz = ZoneInfo(lead.timezone)
     except Exception:
         return False
 
     local_hour = datetime.now(tz).hour
     return 8 <= local_hour < 21
-
 
 # =========================
 # Executor Loop
