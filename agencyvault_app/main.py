@@ -896,16 +896,25 @@ async def import_csv(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
         raw = (await file.read()).decode("utf-8", errors="ignore")
+
         reader = csv.DictReader(io.StringIO(raw))
+        rows = list(reader)
+
+        leads = normalize_to_leads(rows)
+
         added = 0
-        for row in reader:
-            if _import_row(db, row):
+        for lead in leads:
+            if _import_row(db, lead):
                 added += 1
+
         _log(db, None, None, "IMPORT_CSV", f"imported={added}")
         db.commit()
+
         return RedirectResponse("/dashboard", status_code=303)
+
     finally:
         db.close()
+
 
 @app.post("/import/image")
 async def import_image(file: UploadFile = File(...)):
