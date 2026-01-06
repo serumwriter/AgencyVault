@@ -3,6 +3,34 @@
 
 <h2>Leads</h2>
 
+<form method="post" action="/control/pause" style="margin-bottom:12px;">
+  <button style="
+    background:#7c2d12;
+    color:white;
+    border:none;
+    padding:12px 16px;
+    border-radius:14px;
+    font-weight:700;
+    cursor:pointer;
+  ">
+    ⏸ Pause All AI Work
+  </button>
+</form>
+
+<form method="post" action="/control/resume">
+  <button style="
+    background:#065f46;
+    color:white;
+    border:none;
+    padding:12px 16px;
+    border-radius:14px;
+    font-weight:700;
+    cursor:pointer;
+  ">
+    ▶️ Resume AI Work
+  </button>
+</form>
+
 <form method="post" action="/leads/create">
   <input name="name" placeholder="Name" required><br>
   <input name="phone" placeholder="Phone" required><br>
