@@ -798,15 +798,66 @@ def imports_page():
 # Import helpers
 # =========================
 def _import_row(db: Session, row: dict) -> bool:
-    phone = normalize_phone(row.get("phone") or row.get("Phone") or row.get("mobile") or row.get("Mobile"))
-    email = clean_text(row.get("email") or row.get("Email"))
-    name = clean_text(row.get("name") or row.get("full_name") or row.get("Name") or row.get("Full Name")) or "Unknown"
+    # --- Normalize phone (required) ---
+    phone = normalize_phone(
+        row.get("phone")
+        or row.get("Phone")
+        or row.get("mobile")
+        or row.get("Mobile")
+    )
     if not phone:
         return False
-    if dedupe_exists(db, phone, email):
-        return False
-    db.add(Lead(full_name=name, phone=phone, email=email, state="NEW", created_at=_now(), updated_at=_now()))
-    return True
+
+    # --- Email ---
+    email = clean_text(row.get("email") or row.get("Email"))
+
+    # --- Name (protect against garbage) ---
+    first = clean_text(row.get("first_name") or row.get("First Name"))
+    last = clean_text(row.get("last_name") or row.get("Last Name"))
+
+    raw_name = clean_text(
+        row.get("name")
+        or row.get("full_name")
+        or row.get("Name")
+        or row.get("Full Name")
+    )
+
+    bad_markers = ["@", "email", "phone", "coverage", "policy"]
+    if raw_name and any(b in raw_name.lower() for b in bad_markers):
+        raw_name = None
+
+    full_name = (
+        " ".join(x for x in [first, last] if x)
+        or raw_name
+        or "Unknown"
+    )
+
+    # --- Insurance fields ---
+    coverage_requested = clean_text(
+        row.get("coverage_requested")
+        or row.get("coverage")
+        or row.get("Desired Coverage Amount")
+        or row.get("amount")
+    )
+
+    coverage_type = clean_text(
+        row.get("coverage_type")
+        or row.get("policy_type")
+        or row.get("type")
+    )
+
+    birthdate = clean_text(
+        row.get("birthdate")
+        or row.get("Date of Birth")
+        or row.get("dob")
+    )
+
+    us_state = clean_text(
+        row.get("us_state")
+        or row.get("State")
+    )
+
+    # --- HARD GUARD: never confuse workflow stat
 
 # =========================
 # Imports (CSV / Image / PDF / Google / Drive)
