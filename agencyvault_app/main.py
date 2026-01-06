@@ -1,10 +1,14 @@
+# =========================
+# PART 1 of 2 — main.py (PASTE THIS FIRST)
+# =========================
+
 import csv
 import io
 import json
 import os
 import re
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request
@@ -18,14 +22,9 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from .database import engine, SessionLocal
 from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message
-from .image_import import extract_text_from_pdf_bytes
+from .image_import import extract_text_from_image_bytes, parse_leads_from_text, extract_text_from_pdf_bytes
 from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
-from .image_import import extract_text_from_image_bytes, parse_leads_from_text
-from .twilio_client import (
-    send_alert_sms,
-    send_lead_sms,
-    make_call,
-)
+from .twilio_client import send_alert_sms, send_lead_sms, make_call
 
 app = FastAPI(title="AgencyVault — Command Center")
 
@@ -61,9 +60,8 @@ def normalize_phone(val) -> Optional[str]:
         return "+1" + d
     if len(d) == 11 and d.startswith("1"):
         return "+" + d
-    if len(d) >= 12 and val.startswith("+"):
-        # already E164-ish
-        return "+" + re.sub(r"[^\d]", "", val)
+    if len(d) >= 12 and (val.startswith("+") or (val.startswith("00") and len(d) >= 12)):
+        return "+" + d
     return None
 
 def safe_first_name(full_name: str) -> str:
@@ -135,18 +133,34 @@ def root():
 # =========================
 @app.get("/sw.js")
 def sw():
-    return Response(
-        content="/* no-op service worker for AgencyVault */",
-        media_type="application/javascript",
-    )
+    return Response(content="/* no-op service worker for AgencyVault */", media_type="application/javascript")
 
 # =========================
-# Google Drive: download ANY file bytes (images, etc.)
+# Google Drive helpers (ENV creds default)
 # =========================
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
+
+def _load_google_service_account(creds_json_optional: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Priority:
+      1) creds_json posted from form (optional)
+      2) Render ENV GOOGLE_SERVICE_ACCOUNT_JSON
+    """
+    raw = (creds_json_optional or "").strip()
+    if not raw:
+        raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+
+    if not raw:
+        raise ValueError(
+            "Missing Google credentials. Set GOOGLE_SERVICE_ACCOUNT_JSON in Render Environment."
+        )
+    try:
+        return json.loads(raw)
+    except Exception:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON (or pasted creds_json is invalid).")
 
 def _drive_creds(service_account_info: dict) -> Credentials:
     return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
@@ -170,7 +184,7 @@ def drive_download_bytes(service_account_info: dict, file_id: str) -> bytes:
 async def llm_reply(user_text: str, context: str = "") -> str:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        return "AI is OFF (OPENAI_API_KEY missing). I can still run built-in commands like: 'counts', 'show pending', 'show newest leads'."
+        return "AI is OFF (OPENAI_API_KEY missing). I can still run built-in commands like: counts | show pending | show newest | lead 123"
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-5").strip()
 
@@ -198,9 +212,8 @@ async def llm_reply(user_text: str, context: str = "") -> str:
             json=payload,
         )
         if r.status_code >= 400:
-            # show short error, but do not break UI
             txt = (r.text or "")[:600]
-            return f"AI error ({r.status_code}). If this says quota/429, add billing or reduce usage.\n\nRaw:\n{txt}"
+            return f"AI error ({r.status_code}). If this says quota/429, add billing.\n\nRaw:\n{txt}"
 
         data = r.json()
 
@@ -228,9 +241,12 @@ def offline_assistant(db: Session, msg: str) -> str:
             "- show pending\n"
             "- show newest\n"
             "- lead <id>\n"
-            "- how to import\n"
-            "- how to call\n"
+            "- pause status\n"
         )
+
+    if "pause" in low and "status" in low:
+        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
+        return f"GLOBAL_PAUSE is {'ON (paused)' if paused else 'OFF (running)'}."
 
     if "counts" in low:
         total = db.query(Lead).count()
@@ -286,36 +302,19 @@ def offline_assistant(db: Session, msg: str) -> str:
             f"Last contacted: {lead.last_contacted_at or '—'}"
         )
 
-    if "import" in low:
-        return "Go to Dashboard → Imports panel (right column). You can import CSV, images, Google Sheet, Google Doc, Drive CSV, Drive Image."
-
-    if "call" in low:
-        return "Open a lead → use Call Now / Text Now buttons (coming via Actions/Planner). For now, use AI Planner to create actions, then run your worker to execute them."
-
     return "Try: counts | show pending | show newest | lead <id> | help"
 
 # =========================
-# AI Planner (creates actions)
+# AI Planner (creates actions) + GLOBAL PAUSE
 # =========================
 def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
-    # 🔒 GLOBAL PAUSE CHECK (DO NOT REMOVE)
-    paused = mem_get(db, 0, "GLOBAL_PAUSE")
-    if paused == "1":
-        return {
-            "ok": False,
-            "paused": True,
-            "message": "AI work is currently paused by operator."
-        }
+    paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
+    if paused:
+        return {"ok": False, "paused": True, "message": "AI work is PAUSED by operator."}
 
-    run = AgentRun(
-        mode="planning",
-        status="STARTED",
-        batch_size=batch_size,
-        notes=""
-    )
+    run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="")
     db.add(run)
     db.flush()
-
 
     planned = 0
     considered = 0
@@ -333,7 +332,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
         considered += 1
         first = safe_first_name(lead.full_name)
 
-        # TEXT 1
+        # TEXT FIRST (aged leads)
         msg1 = (
             f"Hi{(' ' + first) if first else ''}, this is Nick’s office. "
             "You requested life insurance info before — totally okay if it’s been a while. "
@@ -349,7 +348,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
         ))
         planned += 1
 
-        # CALL (queued)
+        # CALL queued after text
         db.add(Action(
             lead_id=lead.id,
             type="CALL",
@@ -377,8 +376,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 def ai_plan():
     db = SessionLocal()
     try:
-        out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
-        return out
+        return plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
     finally:
         db.close()
 
@@ -396,27 +394,26 @@ async def assistant_api(payload: dict):
         if not msg:
             return {"reply": "Try: counts | show pending | show newest | lead 123 | run planner"}
 
-        # fast shortcuts (even when AI is enabled)
         low = msg.lower()
         if "run" in low and "planner" in low:
             out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
             _log(db, None, out.get("run_id"), "ASSISTANT_RESULT", f"Planner ran: {out}")
             db.commit()
-            return {"reply": f"✅ Planner ran.\nPlanned: {out['planned_actions']}\nConsidered: {out['considered']}\nRun ID: {out['run_id']}"}
+            return {"reply": json.dumps(out, indent=2)}
 
-        # If AI quota is dead, offline assistant keeps it usable
-        if "OPENAI_API_KEY" not in os.environ or not (os.getenv("OPENAI_API_KEY") or "").strip():
+        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        if not api_key:
             reply = offline_assistant(db, msg)
             _log(db, None, None, "ASSISTANT_OFFLINE_REPLY", reply[:2000])
             db.commit()
             return {"reply": reply}
 
-        # Provide live context to LLM
         total = db.query(Lead).count()
         new = db.query(Lead).filter(Lead.state == "NEW").count()
         working = db.query(Lead).filter(Lead.state == "WORKING").count()
         dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
         pending = db.query(Action).filter(Action.status == "PENDING").count()
+        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
 
         failed = (
             db.query(Action)
@@ -428,7 +425,7 @@ async def assistant_api(payload: dict):
         failed_lines = [f"Action#{a.id} {a.type} lead={a.lead_id} err={(a.error or '')[:160]}" for a in failed]
 
         context = (
-            f"Counts: total={total} NEW={new} WORKING={working} DNC={dnc} pending_actions={pending}\n"
+            f"Counts: total={total} NEW={new} WORKING={working} DNC={dnc} pending_actions={pending} paused={paused}\n"
             f"Recent failures:\n" + ("\n".join(failed_lines) if failed_lines else "None.")
         )
 
@@ -440,7 +437,7 @@ async def assistant_api(payload: dict):
         db.close()
 
 # =========================
-# Dashboard (Facebook/MySpace-style Command Center)
+# Dashboard helpers
 # =========================
 def _kpi_card(label: str, value: Any, sub: str = "") -> str:
     return f"""
@@ -452,7 +449,6 @@ def _kpi_card(label: str, value: Any, sub: str = "") -> str:
     """
 
 def _svg_donut(pct: float) -> str:
-    # pct 0..100
     pct = max(0.0, min(100.0, pct))
     r = 16
     c = 2 * 3.14159 * r
@@ -467,6 +463,9 @@ def _svg_donut(pct: float) -> str:
     </svg>
     """
 
+# =========================
+# Dashboard (Command Center)
+# =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db = SessionLocal()
@@ -477,8 +476,8 @@ def dashboard():
         contacted = db.query(Lead).filter(Lead.state == "CONTACTED").count()
         dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
         pending = db.query(Action).filter(Action.status == "PENDING").count()
+        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
 
-        # activity feed
         logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(18).all()
         feed = ""
         for l in logs:
@@ -493,14 +492,15 @@ def dashboard():
             </div>
             """
 
-        # newest leads
         leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(10).all()
         leads_html = ""
         for l in leads:
             leads_html += f"""
             <div class="lead-row">
-              <div class="lead-name"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a></div>
-              <div class="lead-meta">{l.phone or "—"} · {l.email or "—"}</div>
+              <div>
+                <div class="lead-name"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a></div>
+                <div class="lead-meta">{l.phone or "—"} · {l.email or "—"}</div>
+              </div>
               <div class="lead-badges">
                 <span class="pill">{l.state}</span>
                 <form method="post" action="/leads/delete/{l.id}" style="margin:0"
@@ -511,12 +511,14 @@ def dashboard():
             </div>
             """
 
-        # quick donuts
         denom = max(total, 1)
         pct_new = (new / denom) * 100.0
         pct_working = (working / denom) * 100.0
         pct_contacted = (contacted / denom) * 100.0
         pct_dnc = (dnc / denom) * 100.0
+
+        pause_label = "▶ Resume Work" if paused else "⏸ Pause Work"
+        pause_sub = "Paused" if paused else "Running"
 
         return HTMLResponse(f"""
 <!doctype html>
@@ -533,248 +535,73 @@ def dashboard():
     --text:#e6edf3;
     --muted:rgba(230,237,243,.72);
     --link:#8ab4f8;
-    --good:#1f9d6d;
-    --warn:#c7a312;
-    --bad:#c03a3a;
   }}
-  body {{
-    margin:0;
-    background:var(--bg);
-    color:var(--text);
-    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
-  }}
+  body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }}
   a {{ color:var(--link); text-decoration:none; }}
   a:hover {{ text-decoration:underline; }}
-
-  .wrap {{
-    display:grid;
-    grid-template-columns: 260px 1fr 360px;
-    min-height:100vh;
-  }}
-
-  .sidebar {{
-    border-right:1px solid var(--border);
-    padding:16px 14px;
-    position:sticky;
-    top:0;
-    height:100vh;
-    overflow:auto;
-    background:linear-gradient(180deg, rgba(17,24,39,.55), rgba(11,15,23,.55));
-  }}
-  .brand {{
-    font-weight:900;
-    letter-spacing:.2px;
-    font-size:20px;
-    margin-bottom:10px;
-  }}
-  .nav {{
-    display:flex;
-    flex-direction:column;
-    gap:8px;
-    margin-top:12px;
-  }}
-  .nav a {{
-    display:flex;
-    align-items:center;
-    gap:10px;
-    padding:10px 12px;
-    border-radius:12px;
-    border:1px solid rgba(50,74,110,.15);
-    background:rgba(15,22,36,.55);
-  }}
-  .nav a:hover {{
-    border-color:rgba(138,180,248,.55);
-  }}
+  .wrap {{ display:grid; grid-template-columns: 260px 1fr 360px; min-height:100vh; }}
+  .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; position:sticky; top:0; height:100vh; overflow:auto;
+             background:linear-gradient(180deg, rgba(17,24,39,.55), rgba(11,15,23,.55)); }}
+  .brand {{ font-weight:900; letter-spacing:.2px; font-size:20px; margin-bottom:10px; }}
+  .nav {{ display:flex; flex-direction:column; gap:8px; margin-top:12px; }}
+  .nav a {{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:12px; border:1px solid rgba(50,74,110,.15); background:rgba(15,22,36,.55); }}
+  .nav a:hover {{ border-color:rgba(138,180,248,.55); }}
   .nav small {{ color:var(--muted); display:block; margin-left:28px; margin-top:-6px; }}
 
-  .main {{
-    padding:18px 18px 30px 18px;
-  }}
-  .topbar {{
-    display:flex;
-    justify-content:space-between;
-    align-items:flex-end;
-    gap:14px;
-    flex-wrap:wrap;
-    margin-bottom:14px;
-  }}
-  .title {{
-    font-size:28px;
-    font-weight:900;
-  }}
-  .subtitle {{
-    color:var(--muted);
-    font-size:13px;
-  }}
-
-  .kpis {{
-    display:grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap:10px;
-    margin-top:12px;
-  }}
-  .kpi {{
-    background:var(--panel);
-    border:1px solid var(--border);
-    border-radius:16px;
-    padding:12px;
-  }}
+  .main {{ padding:18px 18px 30px 18px; }}
+  .topbar {{ display:flex; justify-content:space-between; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-bottom:14px; }}
+  .title {{ font-size:28px; font-weight:900; }}
+  .subtitle {{ color:var(--muted); font-size:13px; }}
+  .kpis {{ display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:10px; margin-top:12px; }}
+  .kpi {{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:12px; }}
   .kpi-label {{ color:var(--muted); font-size:12px; }}
   .kpi-value {{ font-size:22px; font-weight:900; margin-top:2px; }}
   .kpi-sub {{ color:var(--muted); font-size:12px; margin-top:4px; }}
 
-  .grid {{
-    display:grid;
-    grid-template-columns: 1fr 1fr;
-    gap:12px;
-    margin-top:12px;
-  }}
-  .panel {{
-    background:var(--panel);
-    border:1px solid var(--border);
-    border-radius:18px;
-    padding:14px;
-  }}
-  .panel h2 {{
-    margin:0 0 10px 0;
-    font-size:16px;
-    font-weight:900;
-    letter-spacing:.2px;
-  }}
+  .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px; }}
+  .panel {{ background:var(--panel); border:1px solid var(--border); border-radius:18px; padding:14px; }}
+  .panel h2 {{ margin:0 0 10px 0; font-size:16px; font-weight:900; letter-spacing:.2px; }}
 
-  .feed-item {{
-    padding:10px 0;
-    border-bottom:1px solid var(--border);
-  }}
-  .feed-top {{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:10px;
-  }}
+  .feed-item {{ padding:10px 0; border-bottom:1px solid var(--border); }}
+  .feed-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
   .feed-title {{ font-weight:800; }}
   .feed-time {{ color:var(--muted); font-size:12px; }}
   .feed-meta {{ color:var(--muted); font-size:12px; margin-top:2px; }}
   .feed-body {{ margin-top:6px; color:rgba(230,237,243,.9); }}
 
-  .lead-row {{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:10px;
-    padding:10px 0;
-    border-bottom:1px solid var(--border);
-  }}
+  .lead-row {{ display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--border); }}
   .lead-name {{ font-weight:800; }}
   .lead-meta {{ color:var(--muted); font-size:12px; margin-top:2px; }}
-  .lead-badges {{
-    display:flex;
-    align-items:center;
-    gap:8px;
-    flex-wrap:wrap;
-    justify-content:flex-end;
-  }}
-  .pill {{
-    padding:3px 9px;
-    border-radius:999px;
-    border:1px solid rgba(138,180,248,.25);
-    background:rgba(17,24,39,.6);
-    font-size:12px;
-    color:rgba(230,237,243,.9);
-  }}
+  .lead-badges {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
+  .pill {{ padding:3px 9px; border-radius:999px; border:1px solid rgba(138,180,248,.25); background:rgba(17,24,39,.6); font-size:12px; color:rgba(230,237,243,.9); }}
 
-  .right {{
-    border-left:1px solid var(--border);
-    padding:16px 14px;
-    position:sticky;
-    top:0;
-    height:100vh;
-    overflow:auto;
-    background:linear-gradient(180deg, rgba(15,22,36,.55), rgba(11,15,23,.55));
-  }}
+  .right {{ border-left:1px solid var(--border); padding:16px 14px; position:sticky; top:0; height:100vh; overflow:auto;
+            background:linear-gradient(180deg, rgba(15,22,36,.55), rgba(11,15,23,.55)); }}
 
-  .btn {{
-    display:inline-flex;
-    align-items:center;
-    justify-content:center;
-    gap:8px;
-    padding:10px 12px;
-    border-radius:12px;
-    border:1px solid rgba(50,74,110,.35);
-    background:rgba(17,24,39,.75);
-    color:var(--text);
-    cursor:pointer;
-    text-decoration:none;
-    font-weight:700;
-  }}
+  .btn {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:10px 12px; border-radius:12px;
+         border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text); cursor:pointer; text-decoration:none; font-weight:700; }}
   .btn:hover {{ border-color:rgba(138,180,248,.6); }}
-  .mini {{
-    padding:7px 10px;
-    border-radius:10px;
-    border:1px solid rgba(50,74,110,.35);
-    background:rgba(17,24,39,.75);
-    color:var(--text);
-    cursor:pointer;
-    font-weight:800;
-    font-size:12px;
-  }}
-  .danger {{
-    background:rgba(192,58,58,.18);
-    border-color:rgba(192,58,58,.35);
-  }}
-  .danger:hover {{
-    border-color:rgba(192,58,58,.65);
-  }}
+  .mini {{ padding:7px 10px; border-radius:10px; border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text);
+          cursor:pointer; font-weight:800; font-size:12px; }}
+  .danger {{ background:rgba(192,58,58,.18); border-color:rgba(192,58,58,.35); }}
+  .danger:hover {{ border-color:rgba(192,58,58,.65); }}
 
-  textarea {{
-    width:100%;
-    background:rgba(11,15,23,.75);
-    color:var(--text);
-    border:1px solid rgba(50,74,110,.35);
-    border-radius:14px;
-    padding:12px;
-    min-height:110px;
-    font-size:14px;
-    outline:none;
-  }}
-  pre {{
-    white-space:pre-wrap;
-    margin:10px 0 0 0;
-    color:rgba(230,237,243,.9);
-    font-size:13px;
-  }}
-  input, select {{
-    width:100%;
-    background:rgba(11,15,23,.75);
-    color:var(--text);
-    border:1px solid rgba(50,74,110,.35);
-    border-radius:12px;
-    padding:10px;
-    outline:none;
-  }}
+  textarea {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:14px;
+            padding:12px; min-height:110px; font-size:14px; outline:none; }}
+  pre {{ white-space:pre-wrap; margin:10px 0 0 0; color:rgba(230,237,243,.9); font-size:13px; }}
+  input, select {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:12px; padding:10px; outline:none; }}
   .muted {{ color:var(--muted); font-size:12px; }}
 
-  .donuts {{
-    display:grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap:10px;
-  }}
-  .donut-card {{
-    background:var(--panel2);
-    border:1px solid var(--border);
-    border-radius:16px;
-    padding:12px;
-    display:flex;
-    align-items:center;
-    justify-content:space-between;
-    gap:10px;
-  }}
+  .donuts {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; }}
+  .donut-card {{ background:var(--panel2); border:1px solid var(--border); border-radius:16px; padding:12px; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
   .donut-label {{ font-weight:900; }}
   .donut-sub {{ color:var(--muted); font-size:12px; margin-top:2px; }}
 
   @media (max-width: 1100px) {{
     .wrap {{ grid-template-columns: 1fr; }}
     .sidebar, .right {{ position:relative; height:auto; border:none; }}
+    .kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .grid {{ grid-template-columns: 1fr; }}
   }}
 </style>
 </head>
@@ -790,15 +617,15 @@ def dashboard():
       <a href="/dashboard">🏠 Dashboard<small>Command Center</small></a>
       <a href="/leads">📇 All Leads<small>Search + filter</small></a>
       <a href="/leads/new">➕ Add Lead<small>Manual entry</small></a>
-      <a href="/imports">⬆️ Imports<small>CSV · Google · Images</small></a>
+      <a href="/imports">⬆️ Imports<small>CSV · Google · Images · PDF</small></a>
       <a href="/actions">✅ Action Queue<small>Calls/texts planned</small></a>
       <a href="/activity">🧾 Activity Log<small>What AI did</small></a>
-      <a href="/admin">🛡️ Admin<small>Mass delete</small></a>
+      <a href="/admin">🛡️ Admin<small>Mass delete + pause</small></a>
       <a href="/ai/plan">🤖 Run Planner<small>Create outreach actions</small></a>
     </div>
 
     <div style="margin-top:14px" class="muted">
-      Tip: use the AI box to ask things like “counts”, “show pending”, “show newest”.
+      Tip: AI box accepts “counts”, “show pending”, “show newest”, “run planner”.
     </div>
   </aside>
 
@@ -821,66 +648,43 @@ def dashboard():
       {_kpi_card("WORKING", working, "In outreach")}
       {_kpi_card("CONTACTED", contacted, "Hot replies / progressed")}
       {_kpi_card("DNC", dnc, "Compliance")}
-      {_kpi_card("Pending Actions", pending, "Calls + texts queued")}
+      {_kpi_card("Pending Actions", pending, f"Planner {pause_sub}")}
     </div>
 
     <div class="grid">
       <div class="panel">
         <h2>📈 Distribution</h2>
         <div class="donuts">
-          <div class="donut-card">
-            <div>
-              <div class="donut-label">NEW</div>
-              <div class="donut-sub">{new} of {total}</div>
-            </div>
-            {_svg_donut(pct_new)}
-          </div>
-          <div class="donut-card">
-            <div>
-              <div class="donut-label">WORKING</div>
-              <div class="donut-sub">{working} of {total}</div>
-            </div>
-            {_svg_donut(pct_working)}
-          </div>
-          <div class="donut-card">
-            <div>
-              <div class="donut-label">CONTACTED</div>
-              <div class="donut-sub">{contacted} of {total}</div>
-            </div>
-            {_svg_donut(pct_contacted)}
-          </div>
-          <div class="donut-card">
-            <div>
-              <div class="donut-label">DNC</div>
-              <div class="donut-sub">{dnc} of {total}</div>
-            </div>
-            {_svg_donut(pct_dnc)}
-          </div>
+          <div class="donut-card"><div><div class="donut-label">NEW</div><div class="donut-sub">{new} of {total}</div></div>{_svg_donut(pct_new)}</div>
+          <div class="donut-card"><div><div class="donut-label">WORKING</div><div class="donut-sub">{working} of {total}</div></div>{_svg_donut(pct_working)}</div>
+          <div class="donut-card"><div><div class="donut-label">CONTACTED</div><div class="donut-sub">{contacted} of {total}</div></div>{_svg_donut(pct_contacted)}</div>
+          <div class="donut-card"><div><div class="donut-label">DNC</div><div class="donut-sub">{dnc} of {total}</div></div>{_svg_donut(pct_dnc)}</div>
         </div>
       </div>
 
       <div class="panel">
         <h2>📇 Newest Leads</h2>
-        <div>
-          {leads_html or '<div class="muted">No leads yet.</div>'}
-        </div>
+        <div>{leads_html or '<div class="muted">No leads yet.</div>'}</div>
       </div>
 
       <div class="panel">
         <h2>🧾 Live Activity Feed</h2>
-        <div>
-          {feed or '<div class="muted">No activity yet.</div>'}
-        </div>
+        <div>{feed or '<div class="muted">No activity yet.</div>'}</div>
       </div>
 
       <div class="panel">
         <h2>📅 Schedule</h2>
         <div class="muted" style="margin-bottom:10px;">
-          Calendar sync to Google is a separate integration (needs Google OAuth). This panel is ready for that next.
+          If you want a real Google Calendar embed, set <b>GOOGLE_CALENDAR_EMBED_URL</b> in Render.
         </div>
         <div style="background:rgba(11,15,23,.6); border:1px solid var(--border); border-radius:14px; padding:12px;">
-          <div style="font-weight:900;">Today</div>
-          <div class="muted">This will show appointments once calendar integration is enabled.</div>
+          <iframe
+            src="{(os.getenv('GOOGLE_CALENDAR_EMBED_URL') or '').strip()}"
+            style="width:100%;height:320px;border:0;border-radius:12px;background:rgba(11,15,23,.35);"
+          ></iframe>
+          <div class="muted" style="margin-top:8px;">
+            If the iframe is blank, you haven’t set GOOGLE_CALENDAR_EMBED_URL yet.
+          </div>
         </div>
       </div>
     </div>
@@ -889,17 +693,30 @@ def dashboard():
   <aside class="right">
     <div class="panel" style="padding:14px;">
       <h2>🤖 AI Employee</h2>
-      <div class="muted">Ask questions like you do with me. If OpenAI quota is out, it auto-switches to Offline Assistant.</div>
+      <div class="muted">If OpenAI quota is out, it auto-switches to Offline Assistant.</div>
       <textarea id="cmd" placeholder="Try: counts | show pending | show newest | lead 12 | run planner"></textarea>
       <div style="display:flex; gap:10px; margin-top:10px;">
         <button class="btn" onclick="send()">Send</button>
         <button class="btn" onclick="document.getElementById('cmd').value='counts'; send();">Counts</button>
+        <button class="btn" onclick="document.getElementById('cmd').value='run planner'; send();">Run Planner</button>
       </div>
       <pre id="out" class="muted"></pre>
     </div>
 
     <div class="panel" style="margin-top:12px;">
-      <h2>⬆️ Imports (Right Here)</h2>
+      <h2>⏯ Work Control</h2>
+      <div class="muted" style="margin-bottom:8px;">Pause/resume planner + worker behavior (admin token required).</div>
+      <form method="post" action="/admin/pause-toggle">
+        <input name="token" placeholder="ADMIN_TOKEN" />
+        <div style="margin-top:8px;">
+          <button class="btn" type="submit">{pause_label}</button>
+        </div>
+      </form>
+      <div class="muted" style="margin-top:8px;">Current: <b>{pause_sub}</b></div>
+    </div>
+
+    <div class="panel" style="margin-top:12px;">
+      <h2 id="imports">⬆️ Imports (Right Here)</h2>
 
       <div class="muted" style="margin-bottom:8px;">Upload CSV</div>
       <form action="/import/csv" method="post" enctype="multipart/form-data">
@@ -913,58 +730,65 @@ def dashboard():
         <div style="margin-top:8px;"><button class="btn" type="submit">Upload Image</button></div>
       </form>
 
+      <div class="muted" style="margin:14px 0 8px;">Upload PDF (typed PDFs)</div>
+      <form action="/import/pdf" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".pdf,application/pdf" />
+        <div style="margin-top:8px;"><button class="btn" type="submit">Upload PDF</button></div>
+      </form>
+
       <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;"/>
 
-      <div class="muted">Google Sheet</div>
+      <div class="muted">Google Sheet (uses env creds automatically)</div>
       <form action="/import/google-sheet" method="post">
-        <div style="margin-top:8px;"><textarea name="creds_json" placeholder="Paste Service Account JSON here"></textarea></div>
         <div style="margin-top:8px;"><input name="spreadsheet_id" placeholder="Spreadsheet ID" /></div>
         <div style="margin-top:8px;"><input name="range_name" placeholder="Range (ex: Sheet1!A1:Z)" /></div>
         <div style="margin-top:8px;"><button class="btn" type="submit">Import Sheet</button></div>
       </form>
 
-      <div class="muted" style="margin-top:14px;">Google Drive CSV</div>
+      <div class="muted" style="margin-top:14px;">Google Drive CSV (env creds)</div>
       <form action="/import/drive-csv" method="post">
-        <div style="margin-top:8px;"><textarea name="creds_json" placeholder="Paste Service Account JSON here"></textarea></div>
         <div style="margin-top:8px;"><input name="file_id" placeholder="Drive File ID (CSV)" /></div>
         <div style="margin-top:8px;"><button class="btn" type="submit">Import Drive CSV</button></div>
       </form>
 
-      <div class="muted" style="margin-top:14px;">Google Doc</div>
+      <div class="muted" style="margin-top:14px;">Google Doc (env creds)</div>
       <form action="/import/google-doc" method="post">
-        <div style="margin-top:8px;"><textarea name="creds_json" placeholder="Paste Service Account JSON here"></textarea></div>
         <div style="margin-top:8px;"><input name="file_id" placeholder="Doc File ID" /></div>
         <div style="margin-top:8px;"><button class="btn" type="submit">Import Doc</button></div>
       </form>
 
-      <div class="muted" style="margin-top:14px;">Google Drive Image (Photo)</div>
+      <div class="muted" style="margin-top:14px;">Google Drive Image (Photo) (env creds)</div>
       <form action="/import/drive-image" method="post">
-        <div style="margin-top:8px;"><textarea name="creds_json" placeholder="Paste Service Account JSON here"></textarea></div>
         <div style="margin-top:8px;"><input name="file_id" placeholder="Drive Image File ID (JPG/PNG)" /></div>
         <div style="margin-top:8px;"><button class="btn" type="submit">Import Drive Image</button></div>
       </form>
+
+      <div class="muted" style="margin-top:12px;">
+        If Google imports fail: set <b>GOOGLE_SERVICE_ACCOUNT_JSON</b> in Render.
+      </div>
     </div>
+
   </aside>
 
 </div>
 
 <script>
-async function send() {{
+async function send() {
   const msg = document.getElementById("cmd").value;
   const out = document.getElementById("out");
   out.textContent = "Thinking…";
-  try {{
-    const r = await fetch("/api/assistant", {{
+  try {
+    const r = await fetch("/api/assistant", {
       method:"POST",
-      headers:{{"Content-Type":"application/json"}},
-      body:JSON.stringify({{message:msg}})
-    }});
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({message:msg})
+    });
     const d = await r.json();
     out.textContent = d.reply || "OK";
-  }} catch (e) {{
+  } catch (e) {
     out.textContent = "Error: " + e;
-  }}
-}}
+  }
+}
 </script>
 
 </body>
@@ -974,25 +798,32 @@ async function send() {{
         db.close()
 
 # =========================
-# Imports page (still exists for sidebar, but dashboard already has imports)
+# Imports page (sidebar link)
 # =========================
 @app.get("/imports", response_class=HTMLResponse)
 def imports_page():
     return RedirectResponse("/dashboard#imports", status_code=303)
+# =========================
+# PART 2 of 2 — main.py (PASTE THIS SECOND, DIRECTLY UNDER PART 1)
+# =========================
 
+# =========================
+# Import helpers
+# =========================
 def _import_row(db: Session, row: dict) -> bool:
     phone = normalize_phone(row.get("phone") or row.get("Phone") or row.get("mobile") or row.get("Mobile"))
     email = clean_text(row.get("email") or row.get("Email"))
     name = clean_text(row.get("name") or row.get("full_name") or row.get("Name") or row.get("Full Name")) or "Unknown"
-
     if not phone:
         return False
     if dedupe_exists(db, phone, email):
         return False
-
     db.add(Lead(full_name=name, phone=phone, email=email, state="NEW", created_at=_now(), updated_at=_now()))
     return True
 
+# =========================
+# Imports (CSV / Image / PDF / Google / Drive)
+# =========================
 @app.post("/import/csv")
 async def import_csv(file: UploadFile = File(...)):
     db = SessionLocal()
@@ -1026,11 +857,48 @@ async def import_image(file: UploadFile = File(...)):
     finally:
         db.close()
 
-@app.post("/import/google-sheet")
-def import_sheet(creds_json: str = Form(...), spreadsheet_id: str = Form(...), range_name: str = Form(...)):
+@app.post("/import/pdf")
+async def import_pdf(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
-        creds = json.loads(creds_json)
+        if not (file.filename or "").lower().endswith(".pdf"):
+            return JSONResponse({"error": "Only PDF files are allowed"}, status_code=400)
+
+        data = await file.read()
+        text_data = extract_text_from_pdf_bytes(data)
+
+        if not (text_data or "").strip():
+            _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable text found")
+            db.commit()
+            return RedirectResponse("/dashboard", status_code=303)
+
+        leads = parse_leads_from_text(text_data)
+        added = 0
+        for l in leads:
+            if _import_row(db, l):
+                added += 1
+
+        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
+
+@app.post("/import/google-sheet")
+def import_sheet(
+    spreadsheet_id: str = Form(...),
+    range_name: str = Form(...),
+    creds_json: str = Form("")  # optional override
+):
+    db = SessionLocal()
+    try:
+        try:
+            creds = _load_google_service_account(creds_json)
+        except Exception as e:
+            _log(db, None, None, "IMPORT_SHEET_ERROR", str(e))
+            db.commit()
+            return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>", status_code=400)
+
         rows = import_google_sheet(creds, spreadsheet_id, range_name)
         added = 0
         for row in rows:
@@ -1043,10 +911,19 @@ def import_sheet(creds_json: str = Form(...), spreadsheet_id: str = Form(...), r
         db.close()
 
 @app.post("/import/drive-csv")
-def import_drive(creds_json: str = Form(...), file_id: str = Form(...)):
+def import_drive_csv_route(
+    file_id: str = Form(...),
+    creds_json: str = Form("")  # optional override
+):
     db = SessionLocal()
     try:
-        creds = json.loads(creds_json)
+        try:
+            creds = _load_google_service_account(creds_json)
+        except Exception as e:
+            _log(db, None, None, "IMPORT_DRIVE_CSV_ERROR", str(e))
+            db.commit()
+            return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>", status_code=400)
+
         rows = import_drive_csv(creds, file_id)
         added = 0
         for row in rows:
@@ -1059,10 +936,19 @@ def import_drive(creds_json: str = Form(...), file_id: str = Form(...)):
         db.close()
 
 @app.post("/import/google-doc")
-def import_doc(creds_json: str = Form(...), file_id: str = Form(...)):
+def import_doc(
+    file_id: str = Form(...),
+    creds_json: str = Form("")  # optional override
+):
     db = SessionLocal()
     try:
-        creds = json.loads(creds_json)
+        try:
+            creds = _load_google_service_account(creds_json)
+        except Exception as e:
+            _log(db, None, None, "IMPORT_GOOGLE_DOC_ERROR", str(e))
+            db.commit()
+            return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>", status_code=400)
+
         text_data = import_google_doc_text(creds, file_id)
         leads = parse_leads_from_text(text_data)
         added = 0
@@ -1076,10 +962,19 @@ def import_doc(creds_json: str = Form(...), file_id: str = Form(...)):
         db.close()
 
 @app.post("/import/drive-image")
-def import_drive_image(creds_json: str = Form(...), file_id: str = Form(...)):
+def import_drive_image(
+    file_id: str = Form(...),
+    creds_json: str = Form("")  # optional override
+):
     db = SessionLocal()
     try:
-        creds = json.loads(creds_json)
+        try:
+            creds = _load_google_service_account(creds_json)
+        except Exception as e:
+            _log(db, None, None, "IMPORT_DRIVE_IMAGE_ERROR", str(e))
+            db.commit()
+            return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>", status_code=400)
+
         img_bytes = drive_download_bytes(creds, file_id)
         text_data = extract_text_from_image_bytes(img_bytes)
         leads = parse_leads_from_text(text_data)
@@ -1090,39 +985,6 @@ def import_drive_image(creds_json: str = Form(...), file_id: str = Form(...)):
         _log(db, None, None, "IMPORT_DRIVE_IMAGE", f"imported={added}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-# ============================================================
-# PDF UPLOAD
-# ============================================================
-
-@app.post("/import/pdf")
-async def import_pdf(file: UploadFile = File(...)):
-    db = SessionLocal()
-    try:
-        if not file.filename.lower().endswith(".pdf"):
-            return JSONResponse(
-                {"error": "Only PDF files are allowed"},
-                status_code=400
-            )
-
-        data = await file.read()
-        text_data = extract_text_from_pdf_bytes(data)
-
-        if not text_data.strip():
-            return {"imported": 0, "warning": "No readable text found in PDF"}
-
-        leads = parse_leads_from_text(text_data)
-
-        added = 0
-        for l in leads:
-            if _import_row(db, l):
-                added += 1
-
-        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
-        db.commit()
-        return {"imported": added}
-
     finally:
         db.close()
 
@@ -1180,11 +1042,7 @@ def leads_list(search: str = "", state: str = ""):
             q = q.filter(Lead.state == state)
         if search:
             s = f"%{search.strip()}%"
-            q = q.filter(
-                (Lead.full_name.ilike(s)) |
-                (Lead.phone.ilike(s)) |
-                (Lead.email.ilike(s))
-            )
+            q = q.filter((Lead.full_name.ilike(s)) | (Lead.phone.ilike(s)) | (Lead.email.ilike(s)))
         leads = q.order_by(Lead.created_at.desc()).limit(250).all()
 
         rows = ""
@@ -1246,29 +1104,9 @@ def lead_detail(lead_id: int):
         if not lead:
             return HTMLResponse("Not found", status_code=404)
 
-        actions = (
-            db.query(Action)
-            .filter(Action.lead_id == lead_id)
-            .order_by(Action.id.desc())
-            .limit(120)
-            .all()
-        )
-
-        logs = (
-            db.query(AuditLog)
-            .filter(AuditLog.lead_id == lead_id)
-            .order_by(AuditLog.created_at.desc())
-            .limit(250)
-            .all()
-        )
-
-        msgs = (
-            db.query(Message)
-            .filter(Message.lead_id == lead_id)
-            .order_by(Message.created_at.desc())
-            .limit(80)
-            .all()
-        )
+        actions = db.query(Action).filter(Action.lead_id == lead_id).order_by(Action.id.desc()).limit(120).all()
+        logs = db.query(AuditLog).filter(AuditLog.lead_id == lead_id).order_by(AuditLog.created_at.desc()).limit(250).all()
+        msgs = db.query(Message).filter(Message.lead_id == lead_id).order_by(Message.created_at.desc()).limit(80).all()
 
         def block(title, content):
             return f"""
@@ -1287,8 +1125,7 @@ def lead_detail(lead_id: int):
               <div style="opacity:.7;font-size:12px">{m.created_at}</div>
               <div style="margin-top:6px;white-space:pre-wrap">{m.body}</div>
             </div>
-            """
-            for m in msgs
+            """ for m in msgs
         ) or "<div style='opacity:.65'>No messages</div>"
 
         action_html = "".join(
@@ -1299,8 +1136,7 @@ def lead_detail(lead_id: int):
               <pre style="margin-top:6px;white-space:pre-wrap">{a.payload_json}</pre>
               {f"<div style='color:#ffb4b4;font-weight:800'>Error: {a.error}</div>" if a.error else ""}
             </div>
-            """
-            for a in actions
+            """ for a in actions
         ) or "<div style='opacity:.65'>No actions</div>"
 
         log_html = "".join(
@@ -1310,24 +1146,15 @@ def lead_detail(lead_id: int):
               <div style="opacity:.7;font-size:12px">{l.created_at}</div>
               <div style="margin-top:6px;white-space:pre-wrap">{l.detail}</div>
             </div>
-            """
-            for l in logs
+            """ for l in logs
         ) or "<div style='opacity:.65'>No activity</div>"
 
         return HTMLResponse(f"""
 <!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Lead #{lead.id}</title>
-</head>
-
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Lead #{lead.id}</title></head>
 <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-
 <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
-
 <h1 style="margin:14px 0 6px 0">#{lead.id} · {lead.full_name or "Unknown"}</h1>
-
 <div style="display:flex;gap:18px;flex-wrap:wrap;opacity:.92">
   <div>📞 <b>{lead.phone or "—"}</b></div>
   <div>✉️ <b>{lead.email or "—"}</b></div>
@@ -1336,8 +1163,7 @@ def lead_detail(lead_id: int):
 </div>
 
 <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
-  <form method="post" action="/leads/delete/{lead.id}"
-        onsubmit="return confirm('Delete this lead permanently?');" style="margin:0;">
+  <form method="post" action="/leads/delete/{lead.id}" onsubmit="return confirm('Delete this lead permanently?');" style="margin:0;">
     <button style="background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:10px 14px;border-radius:14px;cursor:pointer;font-weight:900;">
       🗑 Delete Lead
     </button>
@@ -1350,9 +1176,7 @@ def lead_detail(lead_id: int):
 {block("💬 Messages", msg_html)}
 {block("⚙️ Actions", action_html)}
 {block("🧾 Activity Log", log_html)}
-
-</body>
-</html>
+</body></html>
         """)
     finally:
         db.close()
@@ -1422,7 +1246,7 @@ def activity():
         db.close()
 
 # =========================
-# Admin: Mass delete (protected)
+# Admin: Mass delete + Pause toggle
 # =========================
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page():
@@ -1450,9 +1274,42 @@ def admin_page():
             Clear Action Queue
           </button>
         </form>
+
+        <h3 style="margin:18px 0 10px 0;">Pause / Resume Work</h3>
+        <form method="post" action="/admin/pause-toggle">
+          <div style="opacity:.8">ADMIN_TOKEN:</div>
+          <input name="token" style="margin-top:8px;padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
+          <button style="margin-left:10px;background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
+            Toggle Pause
+          </button>
+        </form>
       </div>
     </body></html>
     """)
+
+@app.post("/admin/pause-toggle")
+def admin_pause_toggle(request: Request, token: str = Form("")):
+    # accept token from form OR query/header
+    class FakeReq:
+        def __init__(self, req, token):
+            self.headers = dict(req.headers)
+            self.query_params = dict(req.query_params)
+            if token:
+                self.query_params["token"] = token
+    req2 = FakeReq(request, token)
+
+    if not require_admin(req2):  # uses the merged token
+        return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Missing/invalid ADMIN_TOKEN.</div>", status_code=401)
+
+    db = SessionLocal()
+    try:
+        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
+        mem_set(db, 0, "GLOBAL_PAUSE", "0" if paused else "1")
+        _log(db, None, None, "GLOBAL_PAUSE_TOGGLED", f"paused={'0' if paused else '1'}")
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
 
 @app.post("/admin/wipe")
 async def admin_wipe(request: Request, confirm: str = Form(...)):
@@ -1523,7 +1380,6 @@ def twilio_sms_inbound(
 
         low = body.lower()
 
-        # Compliance STOP
         if any(x in low for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
             lead.state = "DO_NOT_CONTACT"
             lead.updated_at = _now()
@@ -1532,7 +1388,6 @@ def twilio_sms_inbound(
             db.commit()
             return Response(content="<Response></Response>", media_type="text/xml")
 
-        # Hot intent triggers alert
         if any(x in low for x in ["call me", "ready", "yes", "now", "interested", "today"]):
             lead.state = "CONTACTED"
             lead.updated_at = _now()
