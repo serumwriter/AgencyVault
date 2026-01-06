@@ -1,9 +1,15 @@
 services:
   - type: web
-    name: agencyvault
+    name: agencyvault-web
     env: python
-    region: oregon
-    plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "./start.sh"
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    healthCheckPath: /health
 
+  - type: worker
+    name: agencyvault-worker
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: WORKER=1 bash start.sh
