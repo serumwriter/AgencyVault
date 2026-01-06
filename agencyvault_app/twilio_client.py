@@ -41,3 +41,9 @@ def make_call(to_number: str, twiml_url: str):
         recording_status_callback_event=["completed"],
         recording_status_callback_method="POST",
     )
+def make_call_with_recording(to: str, lead_id: int | None = None):
+    """
+    Wrapper to preserve backward compatibility.
+    Calls the existing make_call() with recording enabled.
+    """
+    return make_call(to=to, lead_id=lead_id)
