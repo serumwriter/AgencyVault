@@ -11,6 +11,59 @@ except Exception:
     OCR_AVAILABLE = False
 
 
+import re
+
+def normalize_insurance_text(raw_text: str) -> list[dict]:
+    """
+    Converts insurance-style text blocks into structured lead dicts.
+    One dict per lead.
+    """
+    leads = []
+    current = {}
+
+    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+
+    for line in lines:
+        low = line.lower()
+
+        # ---- NAME
+        if low.startswith("name"):
+            current["full name"] = line.split(":", 1)[-1].strip()
+
+        # ---- PHONE
+        elif re.search(r"\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}", line):
+            current["phone"] = line
+
+        # ---- EMAIL
+        elif "@" in line and "." in line:
+            current["email"] = line
+
+        # ---- DOB
+        elif "birth" in low or "dob" in low:
+            current["dob"] = line.split(":", 1)[-1].strip()
+
+        # ---- COVERAGE AMOUNT
+        elif "coverage" in low or "$" in line:
+            current["coverage amount"] = line
+
+        # ---- US STATE
+        elif low.startswith("state"):
+            current["state"] = line.split(":", 1)[-1].strip()
+
+        # ---- END OF LEAD BLOCK
+        elif low.startswith("lead id") or low.startswith("reference"):
+            current["lead reference"] = line.split(":", 1)[-1].strip()
+
+        # ---- FINALIZE BLOCK
+        if len(current) >= 3:
+            leads.append(current)
+            current = {}
+
+    if current:
+        leads.append(current)
+
+    return leads
+    
 def extract_text_from_image_bytes(data: bytes) -> str:
     """
     Safely extract text from image bytes.
