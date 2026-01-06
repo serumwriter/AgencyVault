@@ -3,7 +3,8 @@ import os
 import time
 from datetime import datetime
 from sqlalchemy.orm import Session
-import pytz
+from zoneinfo import ZoneInfo
+
 
 from .database import SessionLocal
 from .models import Action, Lead, AgentRun, AuditLog, Message
