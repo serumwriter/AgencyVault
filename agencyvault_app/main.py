@@ -826,67 +826,35 @@ def imports_page():
 # =========================
 # Import helpers
 # =========================
-def _import_row(db: Session, row: dict) -> bool:
-    # --- Normalize phone (required) ---
-    phone = normalize_phone(
-        row.get("phone")
-        or row.get("Phone")
-        or row.get("mobile")
-        or row.get("Mobile")
-    )
-    if not phone:
-        return False
+@app.post("/import/csv")
+async def import_csv(file: UploadFile = File(...)):
+    db = SessionLocal()
+    try:
+        raw = (await file.read()).decode("utf-8", errors="ignore")
 
-    # --- Email ---
-    email = clean_text(row.get("email") or row.get("Email"))
+        reader = csv.DictReader(io.StringIO(raw))
+        rows = list(reader)
 
-    # --- Name (protect against garbage) ---
-    first = clean_text(row.get("first_name") or row.get("First Name"))
-    last = clean_text(row.get("last_name") or row.get("Last Name"))
+        print("CSV ROW COUNT:", len(rows))
+        print("CSV HEADERS:", rows[0].keys() if rows else "NO ROWS")
 
-    raw_name = clean_text(
-        row.get("name")
-        or row.get("full_name")
-        or row.get("Name")
-        or row.get("Full Name")
-    )
+        leads = normalize_to_leads(rows)
 
-    bad_markers = ["@", "email", "phone", "coverage", "policy"]
-    if raw_name and any(b in raw_name.lower() for b in bad_markers):
-        raw_name = None
+        print("NORMALIZED LEADS COUNT:", len(leads))
+        print("NORMALIZED SAMPLE:", leads[:2])
 
-    full_name = (
-        " ".join(x for x in [first, last] if x)
-        or raw_name
-        or "Unknown"
-    )
+        added = 0
+        for lead in leads:
+            if _import_row(db, lead):
+                added += 1
 
-    # --- Insurance fields ---
-    coverage_requested = clean_text(
-        row.get("coverage_requested")
-        or row.get("coverage")
-        or row.get("Desired Coverage Amount")
-        or row.get("amount")
-    )
+        db.commit()
+        print("IMPORTED:", added)
 
-    coverage_type = clean_text(
-        row.get("coverage_type")
-        or row.get("policy_type")
-        or row.get("type")
-    )
+        return RedirectResponse("/dashboard", status_code=303)
 
-    birthdate = clean_text(
-        row.get("birthdate")
-        or row.get("Date of Birth")
-        or row.get("dob")
-    )
-
-    us_state = clean_text(
-        row.get("us_state")
-        or row.get("State")
-    )
-
-    # --- HARD GUARD: never confuse workflow stat
+    finally:
+        db.close()
 
 # =========================
 # Imports (CSV / Image / PDF / Google / Drive)
