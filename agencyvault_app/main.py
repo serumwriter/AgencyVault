@@ -297,9 +297,24 @@ def offline_assistant(db: Session, msg: str) -> str:
 # AI Planner (creates actions)
 # =========================
 def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
-    run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="")
+    # 🔒 GLOBAL PAUSE CHECK (DO NOT REMOVE)
+    paused = mem_get(db, 0, "GLOBAL_PAUSE")
+    if paused == "1":
+        return {
+            "ok": False,
+            "paused": True,
+            "message": "AI work is currently paused by operator."
+        }
+
+    run = AgentRun(
+        mode="planning",
+        status="STARTED",
+        batch_size=batch_size,
+        notes=""
+    )
     db.add(run)
     db.flush()
+
 
     planned = 0
     considered = 0
