@@ -1,79 +1,72 @@
-"""
-Google Drive & Google Sheets import helpers for AgencyVault.
-"""
-
 from typing import List, Dict
-import io
 import csv
+import io
 
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
+def _creds(service_account_info: dict) -> Credentials:
+    return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
 
-def _get_credentials(service_account_info: dict) -> Credentials:
-    return Credentials.from_service_account_info(
-        service_account_info,
-        scopes=SCOPES,
-    )
-
-
-def import_google_sheet(
-    service_account_info: dict,
-    spreadsheet_id: str,
-    range_name: str,
-) -> List[Dict[str, str]]:
-    creds = _get_credentials(service_account_info)
+def import_google_sheet(service_account_info: dict, spreadsheet_id: str, range_name: str) -> List[Dict[str, str]]:
+    creds = _creds(service_account_info)
     service = build("sheets", "v4", credentials=creds)
 
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=range_name)
-        .execute()
-    )
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=range_name
+    ).execute()
 
-    values = result.get("values", [])
-    if not values:
+    rows = result.get("values", [])
+    if not rows:
         return []
 
-    headers = values[0]
-    rows = values[1:]
+    headers = rows[0]
+    data = rows[1:]
+    output: List[Dict[str, str]] = []
 
-    records = []
-    for row in rows:
-        record = {}
-        for i, header in enumerate(headers):
-            record[header] = row[i] if i < len(row) else ""
-        records.append(record)
+    for row in data:
+        record: Dict[str, str] = {}
+        for i, h in enumerate(headers):
+            record[str(h)] = row[i] if i < len(row) else ""
+        output.append(record)
 
-    return records
+    return output
 
-
-def import_drive_csv(
-    service_account_info: dict,
-    file_id: str,
-) -> List[Dict[str, str]]:
-    creds = _get_credentials(service_account_info)
+def import_drive_csv(service_account_info: dict, file_id: str) -> List[Dict[str, str]]:
+    creds = _creds(service_account_info)
     service = build("drive", "v3", credentials=creds)
 
     request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
 
-    downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
 
-    fh.seek(0)
-    decoded = fh.read().decode("utf-8").splitlines()
-    reader = csv.DictReader(decoded)
-
+    buffer.seek(0)
+    text = buffer.read().decode("utf-8", errors="ignore").splitlines()
+    reader = csv.DictReader(text)
     return list(reader)
 
+def import_google_doc_text(service_account_info: dict, file_id: str) -> str:
+    creds = _creds(service_account_info)
+    service = build("drive", "v3", credentials=creds)
+
+    request = service.files().export_media(fileId=file_id, mimeType="text/plain")
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+
+    buffer.seek(0)
+    return buffer.read().decode("utf-8", errors="ignore")
