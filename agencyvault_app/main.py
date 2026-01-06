@@ -1,114 +1,34 @@
-# agencyvault_app/main.py
-# ============================================================
-# AgencyVault (FastAPI) — SAFE, SCALABLE, NO CRASHES
-# - Works with thousands of leads (always LIMITs)
-# - Schedule shows WHO + phone/email + notes + due time
-# - AI planning creates actionable tasks (with notes/due_at)
-# - Background executor sends TEXT tasks safely (rate-limited, retries)
-# - No "Hi Bronze/Ethos" (smart greeting fallback)
-# - Includes CSV upload back (simple /import/csv)
-# ============================================================
-
+import csv
 import io
+import json
 import os
 import re
-import csv
-import json
-import time
-import threading
 from datetime import datetime, timedelta
-from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
+from sqlalchemy.orm import Session
 from sqlalchemy import text
 
-# PACKAGE-LOCAL IMPORTS (LOCKED)
-from .database import SessionLocal, engine
-from .models import Lead, LeadMemory
-from .ai_employee import run_ai_engine
-from .twilio_client import send_alert_sms, send_lead_sms
-from .google_drive_import import import_google_sheet, import_drive_csv
-from .image_import import extract_text_from_image, parse_leads_from_text
+from .database import engine, SessionLocal
+from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message
+from .ai_employee import plan_actions
+from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
+from .image_import import extract_text_from_image_bytes, parse_leads_from_text
+from .twilio_client import lead_id_for_call_sid, send_alert_sms
 
 app = FastAPI(title="AgencyVault")
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # project/src
+# ---------------------------
+# Startup: create schema
+# ---------------------------
+@app.on_event("startup")
+def _startup():
+    Base.metadata.create_all(bind=engine)
 
-
-# ============================================================
-# DB SCHEMA (idempotent)
-# ============================================================
-def ensure_tables():
-    """Create/upgrade tables used by the planner/executor UI."""
-    with engine.begin() as conn:
-        # ai_tasks (planner -> schedule -> executor)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS ai_tasks (
-                id SERIAL PRIMARY KEY,
-                task_type TEXT NOT NULL,
-                lead_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'NEW',
-                due_at TIMESTAMP NULL,
-                notes TEXT NULL,
-                attempt INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """))
-
-        # Add missing columns safely (if table existed earlier)
-        conn.execute(text("ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS due_at TIMESTAMP NULL;"))
-        conn.execute(text("ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS notes TEXT NULL;"))
-        conn.execute(text("ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 0;"))
-        conn.execute(text("ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS last_error TEXT NULL;"))
-        conn.execute(text("ALTER TABLE ai_tasks ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP NOT NULL DEFAULT NOW();"))
-
-        # ai_events (activity log shown on lead detail page)
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS ai_events (
-                id SERIAL PRIMARY KEY,
-                lead_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                message TEXT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """))
-
-
-def log_event(lead_id: int, event_type: str, message: str = ""):
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO ai_events (lead_id, event_type, message)
-                VALUES (:lead_id, :event_type, :message)
-            """),
-            {"lead_id": lead_id, "event_type": event_type, "message": (message or "")[:2000]},
-        )
-
-
-def create_task(task_type: str, lead_id: int, notes: Optional[str] = None, due_at: Optional[datetime] = None):
-    # Always ensure schema exists before inserting
-    ensure_tables()
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO ai_tasks (task_type, lead_id, status, due_at, notes, attempt, created_at, updated_at)
-                VALUES (:task_type, :lead_id, 'NEW', :due_at, :notes, 0, NOW(), NOW())
-            """),
-            {
-                "task_type": task_type,
-                "lead_id": lead_id,
-                "due_at": due_at,
-                "notes": (notes or None),
-            },
-        )
-
-
-# ============================================================
-# SANITIZATION / NORMALIZATION
-# ============================================================
+# ---------------------------
+# Strict sanitization / normalization (prevents corruption)
+# ---------------------------
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 def clean_text(val):
@@ -125,615 +45,756 @@ def normalize_phone(val):
         return "+" + d
     return None
 
-def dedupe_exists(db, phone, email):
+def dedupe_exists(db: Session, phone: str | None, email: str | None) -> bool:
     if phone and db.query(Lead).filter(Lead.phone == phone).first():
         return True
     if email and db.query(Lead).filter(Lead.email == email).first():
         return True
     return False
 
+def _now():
+    return datetime.utcnow()
 
-# ============================================================
-# LeadMemory helpers (kept, but safe + cheap)
-# ============================================================
-def mem_get(db, lead_id, key):
-    row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
-    return row.value if row else None
+def _log(db: Session, lead_id: int | None, run_id: int | None, event: str, detail: str):
+    db.add(AuditLog(lead_id=lead_id, run_id=run_id, event=event, detail=(detail or "")[:5000]))
 
-def mem_set(db, lead_id, key, value):
+def mem_set(db: Session, lead_id: int, key: str, value: str):
     row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
     if row:
-        row.value = str(value)
-        row.updated_at = datetime.utcnow()
+        row.value = value
+        row.updated_at = _now()
     else:
-        db.add(LeadMemory(
-            lead_id=lead_id,
-            key=key,
-            value=str(value),
-            updated_at=datetime.utcnow()
-        ))
+        db.add(LeadMemory(lead_id=lead_id, key=key, value=value, updated_at=_now()))
 
-def needs_human(db, lead_id):
-    return (mem_get(db, lead_id, "needs_human") or "0") == "1"
+def cancel_pending_actions(db: Session, lead_id: int, reason: str):
+    # Enterprise safety: stop future outreach immediately
+    actions = db.query(Action).filter(Action.lead_id == lead_id, Action.status == "PENDING").all()
+    for a in actions:
+        a.status = "SKIPPED"
+        a.error = f"Canceled: {reason}"
+        a.finished_at = _now()
+    _log(db, lead_id, None, "ACTIONS_CANCELED", reason)
 
-
-# ============================================================
-# SMART GREETING (NO “BRONZE/ETHOS/LEAD”)
-# ============================================================
-BAD_NAME_WORDS = {
-    "lead", "bronze", "silver", "gold", "facebook", "meta",
-    "insurance", "prospect", "customer", "unknown", "test",
-    "ethos", "policy", "quote", "client", "applicant"
-}
-
-def safe_greeting_name(full_name: str) -> Optional[str]:
-    raw = (full_name or "").strip()
-    if not raw:
-        return None
-    first = raw.split()[0].strip().lower()
-    if (
-        first in BAD_NAME_WORDS
-        or len(first) < 2
-        or any(c.isdigit() for c in first)
-        or first.endswith("@")
-    ):
-        return None
-    return raw.split()[0].capitalize()
-
-def greeting_for_lead(lead: Lead) -> str:
-    first = safe_greeting_name(getattr(lead, "full_name", "") or "")
-    return f"Hi {first}" if first else "Hi there"
-
-
-# ============================================================
-# STATIC (PWA files)
-# ============================================================
-def safe_file(path: str) -> FileResponse:
-    if not os.path.exists(path):
-        return FileResponse(path, status_code=404)
-    return FileResponse(path)
-
-@app.get("/sw.js")
-def service_worker():
-    return safe_file(os.path.join(BASE_DIR, "app", "static", "sw.js"))
-
-@app.get("/manifest.json")
-def manifest():
-    return safe_file(os.path.join(BASE_DIR, "app", "static", "manifest.json"))
-
-@app.get("/static/icons/icon-192.png")
-def icon_192():
-    return safe_file(os.path.join(BASE_DIR, "app", "static", "icons", "icon-192.png"))
-
-
-# ============================================================
-# BASIC ROUTES
-# ============================================================
-@app.get("/")
-def root():
-    return RedirectResponse("/dashboard")
-
+# ---------------------------
+# Health
+# ---------------------------
 @app.get("/health")
 def health():
-    ensure_tables()
     with engine.begin() as conn:
         conn.execute(text("SELECT 1"))
     return {"ok": True}
 
+@app.get("/")
+def root():
+    return RedirectResponse("/dashboard")
 
-# ============================================================
-# IMPORT ROUTES (Google Drive, Image, CSV Upload)
-# ============================================================
-@app.post("/import/google-drive")
-def import_from_google_drive(
-    file_id: str = Form(...),
-    file_type: str = Form(...),  # sheet | csv
-    creds_json: str = Form(...)
-):
+# ---------------------------
+# COMMAND CENTER DASHBOARD (amazing front page)
+# ---------------------------
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
     db = SessionLocal()
     try:
-        creds = json.loads(creds_json)
+        # Metrics
+        total_leads = db.query(Lead).count()
+        new_leads = db.query(Lead).filter(Lead.state == "NEW").count()
+        working = db.query(Lead).filter(Lead.state == "WORKING").count()
+        dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
 
-        if file_type == "sheet":
-            df = import_google_sheet(creds, file_id)
-        elif file_type == "csv":
-            df = import_drive_csv(creds, file_id)
-        else:
-            return {"error": "file_type must be sheet or csv"}
+        pending_actions = db.query(Action).filter(Action.status == "PENDING").count()
+        recent_logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(12).all()
 
+        # Hot leads: replied IN and not DNC, last 24h
+        since = _now() - timedelta(hours=24)
+        hot = (
+            db.query(Lead)
+            .join(Message, Message.lead_id == Lead.id)
+            .filter(Message.direction == "IN", Message.created_at >= since, Lead.state != "DO_NOT_CONTACT")
+            .order_by(Message.created_at.desc())
+            .limit(8)
+            .all()
+        )
+
+        # Recent leads
+        leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(20).all()
+
+        # Build HTML
+        hot_html = ""
+        for l in hot:
+            hot_html += f"""
+            <div class="card hot">
+              <div class="row">
+                <div><b>{l.full_name or "Unknown"}</b> <span class="muted">[{l.state}]</span></div>
+                <div><a class="btn" href="/leads/{l.id}">Open</a></div>
+              </div>
+              <div class="muted">📞 {l.phone} &nbsp; ✉️ {l.email or "—"}</div>
+            </div>
+            """
+
+        leads_html = ""
+        for l in leads:
+            leads_html += f"""
+            <div class="card">
+              <div class="row">
+                <div>
+                  <b>{l.full_name or "Unknown"}</b>
+                  <span class="pill">{l.state}</span>
+                </div>
+                <div class="row" style="gap:8px;">
+                  <a class="btn" href="/leads/{l.id}">Open</a>
+                  <form method="post" action="/leads/delete/{l.id}" style="margin:0;">
+                    <button class="btn danger" type="submit">Delete</button>
+                  </form>
+                </div>
+              </div>
+              <div class="muted">📞 {l.phone or "—"} &nbsp; ✉️ {l.email or "—"}</div>
+            </div>
+            """
+
+        logs_html = ""
+        for x in recent_logs:
+            logs_html += f"""
+            <div class="log">
+              <b>{x.event}</b> <span class="muted">lead={x.lead_id} • {x.created_at}</span>
+              <div class="muted" style="white-space:pre-wrap">{(x.detail or "")[:400]}</div>
+            </div>
+            """
+
+        return HTMLResponse(f"""
+<!doctype html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AgencyVault Command Center</title>
+  <style>
+    body {{
+      background:#0b0f17; color:#e6edf3; font-family:system-ui;
+      padding:20px; max-width:1100px; margin:0 auto;
+    }}
+    a {{ color:#8ab4f8; text-decoration:none; }}
+    .topbar {{ display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; }}
+    .title {{ font-size:28px; font-weight:800; letter-spacing:0.2px; }}
+    .nav {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .btn {{
+      background:#111827; border:1px solid #223047; color:#e6edf3;
+      padding:8px 12px; border-radius:10px; cursor:pointer; display:inline-block;
+    }}
+    .btn:hover {{ border-color:#3a557d; }}
+    .danger {{ background:#2a0f14; border-color:#5b1a22; }}
+    .grid {{ display:grid; grid-template-columns:repeat(12,1fr); gap:12px; margin-top:14px; }}
+    .panel {{
+      background:#0f1624; border:1px solid #1f2b3e; border-radius:16px; padding:14px;
+    }}
+    .muted {{ opacity:0.75; font-size:13px; }}
+    .kpis {{ display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }}
+    .kpi {{ background:#0b1220; border:1px solid #1f2b3e; border-radius:14px; padding:12px; }}
+    .kpi b {{ font-size:20px; }}
+    .card {{
+      background:#0b1220; border:1px solid #1f2b3e; border-radius:14px; padding:12px; margin-top:10px;
+    }}
+    .card.hot {{ border-color:#5b4b14; background:#141003; }}
+    .row {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+    .pill {{ margin-left:8px; padding:2px 8px; border-radius:999px; background:#111827; border:1px solid #223047; font-size:12px; opacity:0.9; }}
+    .log {{ padding:10px 0; border-bottom:1px solid #1f2b3e; }}
+    .chatbox {{
+      background:#0b1220; border:1px solid #1f2b3e; border-radius:14px; padding:12px;
+    }}
+    textarea {{
+      width:100%; background:#0b0f17; color:#e6edf3; border:1px solid #223047; border-radius:12px;
+      padding:10px; min-height:92px; font-size:14px;
+    }}
+    .small {{ font-size:12px; opacity:0.8; }}
+    .col-7 {{ grid-column: span 7; }}
+    .col-5 {{ grid-column: span 5; }}
+    .col-12 {{ grid-column: span 12; }}
+    @media (max-width: 900px) {{
+      .col-7,.col-5 {{ grid-column: span 12; }}
+      .kpis {{ grid-template-columns:repeat(2,1fr); }}
+    }}
+  </style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="title">AgencyVault — Command Center</div>
+    <div class="nav">
+      <a class="btn" href="/leads/new">➕ New Lead</a>
+      <a class="btn" href="/imports">⬆️ Imports</a>
+      <a class="btn" href="/actions">✅ Action Queue</a>
+      <a class="btn" href="/activity">🧾 Activity</a>
+      <a class="btn" href="/ai/plan">🤖 Run AI Planner</a>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel col-12">
+      <div class="kpis">
+        <div class="kpi"><div class="muted">Total Leads</div><b>{total_leads}</b></div>
+        <div class="kpi"><div class="muted">NEW</div><b>{new_leads}</b></div>
+        <div class="kpi"><div class="muted">WORKING</div><b>{working}</b></div>
+        <div class="kpi"><div class="muted">Pending Actions</div><b>{pending_actions}</b></div>
+      </div>
+      <div class="muted" style="margin-top:10px;">Compliance: DO_NOT_CONTACT = {dnc}</div>
+    </div>
+
+    <div class="panel col-7">
+      <div class="row">
+        <div><b>🔥 Hot Leads (replied in last 24h)</b></div>
+        <div class="muted">AI escalates these to you automatically</div>
+      </div>
+      {hot_html or '<div class="muted" style="margin-top:10px;">No hot replies yet.</div>'}
+    </div>
+
+    <div class="panel col-5">
+      <div class="row">
+        <div><b>💬 AI Employee (Control Chat)</b></div>
+        <div class="muted">You can command the system here</div>
+      </div>
+      <div class="chatbox" style="margin-top:10px;">
+        <textarea id="msg" placeholder="Try: 'show hot leads', 'run planner', 'why is lead 12 stuck', 'pause outreach'"></textarea>
+        <div class="row" style="margin-top:10px;">
+          <button class="btn" onclick="sendMsg()">Send</button>
+          <div class="small muted">Everything is logged. Safe + auditable.</div>
+        </div>
+        <pre id="out" class="muted" style="white-space:pre-wrap;margin-top:10px;"></pre>
+      </div>
+    </div>
+
+    <div class="panel col-7">
+      <div class="row">
+        <div><b>🧾 Live Activity</b></div>
+        <div class="muted">What AI is doing right now</div>
+      </div>
+      <div style="margin-top:8px;">{logs_html or '<div class="muted">No activity yet.</div>'}</div>
+    </div>
+
+    <div class="panel col-5">
+      <div class="row">
+        <div><b>📇 Recent Leads</b></div>
+        <div class="muted">Sorted newest first</div>
+      </div>
+      {leads_html or '<div class="muted" style="margin-top:10px;">No leads yet.</div>'}
+    </div>
+  </div>
+
+<script>
+async function sendMsg() {{
+  const msg = document.getElementById("msg").value;
+  const out = document.getElementById("out");
+  out.textContent = "Thinking...";
+  try {{
+    const r = await fetch("/api/assistant", {{
+      method:"POST",
+      headers:{{"Content-Type":"application/json"}},
+      body:JSON.stringify({{message:msg}})
+    }});
+    const data = await r.json();
+    out.textContent = data.reply || JSON.stringify(data, null, 2);
+  }} catch (e) {{
+    out.textContent = "Error: " + e;
+  }}
+}}
+</script>
+
+</body>
+</html>
+        """)
+    finally:
+        db.close()
+
+# ---------------------------
+# Assistant API (enterprise control interface)
+# ---------------------------
+@app.post("/api/assistant")
+async def assistant_api(payload: dict):
+    msg = (payload.get("message") or "").strip().lower()
+    db = SessionLocal()
+    try:
+        _log(db, None, None, "ASSISTANT_COMMAND", msg)
+        db.commit()
+
+        if not msg:
+            return {"reply": "Type a command like: 'run planner', 'show hot leads', 'show pending actions'."}
+
+        if "run" in msg and "plan" in msg:
+            out = plan_actions(db, batch_size=25)
+            _log(db, None, out.get("run_id"), "ASSISTANT_RESULT", f"Planner ran: {out}")
+            db.commit()
+            return {"reply": f"✅ Planner ran.\nPlanned actions: {out['planned_actions']}\nConsidered: {out['considered']}"}
+
+        if "hot" in msg:
+            since = _now() - timedelta(hours=24)
+            hot = (
+                db.query(Lead)
+                .join(Message, Message.lead_id == Lead.id)
+                .filter(Message.direction == "IN", Message.created_at >= since, Lead.state != "DO_NOT_CONTACT")
+                .order_by(Message.created_at.desc())
+                .limit(10)
+                .all()
+            )
+            lines = [f"- #{l.id} {l.full_name} {l.phone} [{l.state}]" for l in hot]
+            return {"reply": "🔥 Hot leads:\n" + ("\n".join(lines) if lines else "None in last 24h.")}
+
+        if "pending" in msg and "action" in msg:
+            actions = (
+                db.query(Action)
+                .filter(Action.status == "PENDING")
+                .order_by(Action.created_at.asc())
+                .limit(25)
+                .all()
+            )
+            lines = [f"- Action #{a.id} {a.type} lead={a.lead_id}" for a in actions]
+            return {"reply": "✅ Pending actions:\n" + ("\n".join(lines) if lines else "None.")}
+
+        if "lead" in msg and any(ch.isdigit() for ch in msg):
+            # quick lead lookup: "lead 12"
+            nums = re.findall(r"\d+", msg)
+            lead_id = int(nums[0]) if nums else 0
+            lead = db.query(Lead).filter_by(id=lead_id).first()
+            if not lead:
+                return {"reply": f"No lead found with id {lead_id}."}
+            last = lead.last_contacted_at or "—"
+            return {"reply": f"Lead #{lead.id}: {lead.full_name}\nState: {lead.state}\nPhone: {lead.phone}\nEmail: {lead.email or '—'}\nLast contacted: {last}"}
+
+        if "pause" in msg:
+            # simple global pause flag stored in DB via LeadMemory with lead_id=0 is not valid in schema.
+            # We store pause in environment later; for now we tell you.
+            return {"reply": "To pause outreach, set ENABLE_AUTORUN=0 in Render (worker will stop sending)."}
+
+        return {"reply": "Commands I understand:\n- run planner\n- show hot leads\n- show pending actions\n- lead <id>\n- pause outreach\n\nTry: 'run planner'."}
+    finally:
+        db.close()
+
+# ---------------------------
+# Leads CRUD
+# ---------------------------
+@app.get("/leads/new", response_class=HTMLResponse)
+def leads_new_form():
+    return HTMLResponse("""
+    <html><body style="font-family:system-ui;padding:20px;background:#0b0f17;color:#e6edf3">
+      <h2>New Lead</h2>
+      <form method="post" action="/leads/new">
+        <div>Name<br><input name="full_name" style="width:320px"/></div><br>
+        <div>Phone<br><input name="phone" style="width:320px"/></div><br>
+        <div>Email<br><input name="email" style="width:320px"/></div><br>
+        <button type="submit">Create</button>
+      </form>
+      <p><a href="/dashboard">Back</a></p>
+    </body></html>
+    """)
+
+@app.post("/leads/new")
+def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = Form("")):
+    db = SessionLocal()
+    try:
+        p = normalize_phone(phone)
+        e = clean_text(email)
+        n = clean_text(full_name) or "Unknown"
+        if not p:
+            return JSONResponse({"error": "invalid phone"}, status_code=400)
+        if dedupe_exists(db, p, e):
+            return JSONResponse({"error": "lead exists"}, status_code=409)
+        db.add(Lead(full_name=n, phone=p, email=e, state="NEW", created_at=_now(), updated_at=_now()))
+        _log(db, None, None, "LEAD_CREATED", f"{n} {p}")
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
+
+@app.post("/leads/delete/{lead_id}")
+def leads_delete(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if lead:
+            _log(db, lead.id, None, "LEAD_DELETED", f"{lead.full_name} {lead.phone}")
+            db.delete(lead)
+            db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
+
+@app.get("/leads/{lead_id}", response_class=HTMLResponse)
+def lead_detail(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead:
+            return HTMLResponse("Not found", status_code=404)
+
+        actions = db.query(Action).filter(Action.lead_id == lead_id).order_by(Action.created_at.desc()).limit(100).all()
+        logs = db.query(AuditLog).filter(AuditLog.lead_id == lead_id).order_by(AuditLog.created_at.desc()).limit(200).all()
+        msgs = db.query(Message).filter(Message.lead_id == lead_id).order_by(Message.created_at.desc()).limit(50).all()
+
+        action_html = ""
+        for a in actions:
+            action_html += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #222">
+              <b>{a.type}</b> [{a.status}] tool={a.tool}<br>
+              <div style="opacity:0.9;white-space:pre-wrap">{a.payload_json}</div>
+              <div style="opacity:0.8;color:#ffb4b4">{a.error or ""}</div>
+            </div>
+            """
+
+        msg_html = ""
+        for m in msgs:
+            msg_html += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #222">
+              <b>{m.direction}</b> {m.channel} <span style="opacity:0.7">{m.created_at}</span><br>
+              <div style="white-space:pre-wrap;opacity:0.9">{m.body}</div>
+            </div>
+            """
+
+        log_html = ""
+        for l in logs:
+            # Show recording URLs clickable if present
+            detail = l.detail or ""
+            if "RecordingUrl=" in detail or "url=" in detail:
+                detail = detail.replace("url=", "url=")
+            log_html += f"""
+            <div style="padding:8px 0;border-bottom:1px solid #222">
+              <b>{l.event}</b> <span style="opacity:0.7">{l.created_at}</span><br>
+              <div style="white-space:pre-wrap;opacity:0.9">{detail}</div>
+            </div>
+            """
+
+        return HTMLResponse(f"""
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+          <a href="/dashboard">← Back</a>
+          <h2 style="margin:10px 0 6px 0;">{lead.full_name or "Unknown"}</h2>
+          <div>📞 {lead.phone or "—"}</div>
+          <div>✉️ {lead.email or "—"}</div>
+          <div style="opacity:0.8">State: {lead.state}</div>
+
+          <h3 style="margin-top:18px;">Messages</h3>
+          <div style="background:#0f1624;padding:12px;border-radius:10px">{msg_html or "<div>No messages</div>"}</div>
+
+          <h3 style="margin-top:18px;">Actions</h3>
+          <div style="background:#0f1624;padding:12px;border-radius:10px">{action_html or "<div>No actions</div>"}</div>
+
+          <h3 style="margin-top:18px;">Activity (Audit Log)</h3>
+          <div style="background:#0f1624;padding:12px;border-radius:10px">{log_html or "<div>No activity</div>"}</div>
+        </body></html>
+        """)
+    finally:
+        db.close()
+
+# ---------------------------
+# Lists
+# ---------------------------
+@app.get("/activity", response_class=HTMLResponse)
+def activity():
+    db = SessionLocal()
+    try:
+        logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(400).all()
+        rows = ""
+        for l in logs:
+            rows += f"<div style='padding:8px 0;border-bottom:1px solid #222'><b>{l.event}</b> lead={l.lead_id} run={l.run_id} <span style='opacity:0.7'>{l.created_at}</span><div style='white-space:pre-wrap;opacity:0.9'>{l.detail}</div></div>"
+        return HTMLResponse(f"""
+        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+        <a href="/dashboard">← Back</a>
+        <h2>Activity</h2>
+        <div style="background:#0f1624;padding:12px;border-radius:10px">{rows or "No activity"}</div>
+        </body></html>
+        """)
+    finally:
+        db.close()
+
+@app.get("/actions", response_class=HTMLResponse)
+def actions_page():
+    db = SessionLocal()
+    try:
+        actions = db.query(Action).order_by(Action.created_at.desc()).limit(400).all()
+        rows = ""
+        for a in actions:
+            rows += f"<div style='padding:8px 0;border-bottom:1px solid #222'>#{a.id} <b>{a.type}</b> lead={a.lead_id} [{a.status}] <span style='opacity:0.7'>{a.created_at}</span></div>"
+        return HTMLResponse(f"""
+        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
+        <a href="/dashboard">← Back</a>
+        <h2>Action Queue</h2>
+        <div style="background:#0f1624;padding:12px;border-radius:10px">{rows or "No actions"}</div>
+        </body></html>
+        """)
+    finally:
+        db.close()
+
+# ---------------------------
+# AI Planner trigger
+# ---------------------------
+@app.get("/ai/plan")
+def ai_plan():
+    db = SessionLocal()
+    try:
+        out = plan_actions(db, batch_size=25)
+        _log(db, None, out.get("run_id"), "AI_PLAN_TRIGGERED", f"{out}")
+        db.commit()
+        return out
+    finally:
+        db.close()
+
+# ---------------------------
+# Imports
+# ---------------------------
+@app.get("/imports", response_class=HTMLResponse)
+def imports_page():
+    return HTMLResponse("""
+    <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:900px;margin:0 auto;">
+      <a href="/dashboard">← Back</a>
+      <h2>Imports</h2>
+
+      <h3>CSV Upload</h3>
+      <form action="/import/csv" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".csv" />
+        <button type="submit">Upload</button>
+      </form>
+
+      <h3 style="margin-top:18px;">Image Upload (JPEG/PNG)</h3>
+      <form action="/import/image" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept="image/*" />
+        <button type="submit">Upload</button>
+      </form>
+
+      <h3 style="margin-top:18px;">Google Sheet</h3>
+      <form action="/import/google-sheet" method="post">
+        <div>Service Account JSON<br><textarea name="creds_json" style="width:100%;height:120px"></textarea></div>
+        <div>Spreadsheet ID<br><input name="spreadsheet_id" style="width:100%"/></div>
+        <div>Range (example: Sheet1!A1:Z)<br><input name="range_name" style="width:100%"/></div>
+        <button type="submit">Import</button>
+      </form>
+
+      <h3 style="margin-top:18px;">Google Drive CSV</h3>
+      <form action="/import/drive-csv" method="post">
+        <div>Service Account JSON<br><textarea name="creds_json" style="width:100%;height:120px"></textarea></div>
+        <div>File ID<br><input name="file_id" style="width:100%"/></div>
+        <button type="submit">Import</button>
+      </form>
+
+      <h3 style="margin-top:18px;">Google Doc</h3>
+      <form action="/import/google-doc" method="post">
+        <div>Service Account JSON<br><textarea name="creds_json" style="width:100%;height:120px"></textarea></div>
+        <div>Doc File ID<br><input name="file_id" style="width:100%"/></div>
+        <button type="submit">Import</button>
+      </form>
+    </body></html>
+    """)
+
+def _import_row(db: Session, row: dict) -> bool:
+    phone = normalize_phone(row.get("phone") or row.get("Phone") or row.get("mobile") or row.get("Mobile"))
+    email = clean_text(row.get("email") or row.get("Email"))
+    name = clean_text(row.get("name") or row.get("full_name") or row.get("Name") or row.get("Full Name")) or "Unknown"
+
+    if not phone:
+        return False
+    if dedupe_exists(db, phone, email):
+        return False
+
+    db.add(Lead(full_name=name, phone=phone, email=email, state="NEW", created_at=_now(), updated_at=_now()))
+    return True
+
+@app.post("/import/csv")
+async def import_csv(file: UploadFile = File(...)):
+    db = SessionLocal()
+    try:
+        raw = (await file.read()).decode("utf-8", errors="ignore")
+        reader = csv.DictReader(io.StringIO(raw))
         added = 0
-        for _, row in df.iterrows():
-            phone = normalize_phone(row.get("phone") or row.get("Phone") or row.get("mobile"))
-            email = clean_text(row.get("email") or row.get("Email"))
-            name = clean_text(row.get("name") or row.get("full_name") or row.get("Name")) or "Unknown"
-
-            if not phone or dedupe_exists(db, phone, email):
-                continue
-
-            db.add(Lead(
-                full_name=name,
-                phone=phone,
-                email=email,
-                state="NEW",
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            ))
-            added += 1
-
+        for row in reader:
+            if _import_row(db, row):
+                added += 1
+        _log(db, None, None, "IMPORT_CSV", f"imported={added}")
         db.commit()
         return {"imported": added}
     finally:
         db.close()
 
 @app.post("/import/image")
-async def import_from_image(file: UploadFile = File(...)):
+async def import_image(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
-        raw = await file.read()
-        # image_import expects PIL Image in your earlier version;
-        # your current image_import uses PIL + pytesseract directly from PIL Image,
-        # but you previously passed BytesIO. To stay safe, we keep OCR in that module.
-        text_data = extract_text_from_image(io.BytesIO(raw))  # your module supports this usage
+        data = await file.read()
+        text_data = extract_text_from_image_bytes(data)
         leads = parse_leads_from_text(text_data)
-
         added = 0
         for l in leads:
-            phone = normalize_phone(l.get("phone"))
-            email = clean_text(l.get("email"))
-            name = clean_text(l.get("full_name") or l.get("name")) or "Unknown"
-
-            if not phone or dedupe_exists(db, phone, email):
-                continue
-
-            db.add(Lead(
-                full_name=name,
-                phone=phone,
-                email=email,
-                state="NEW",
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            ))
-            added += 1
-
+            if _import_row(db, l):
+                added += 1
+        _log(db, None, None, "IMPORT_IMAGE", f"imported={added}")
         db.commit()
         return {"imported": added}
     finally:
         db.close()
 
-@app.post("/import/csv")
-async def import_csv(file: UploadFile = File(...)):
-    """
-    Brings back simple lead upload.
-    Expected columns: name/full_name, phone, email (case-insensitive).
-    """
+@app.post("/import/google-sheet")
+def import_sheet(creds_json: str = Form(...), spreadsheet_id: str = Form(...), range_name: str = Form(...)):
     db = SessionLocal()
     try:
-        raw = (await file.read()).decode("utf-8", errors="ignore")
-        reader = csv.DictReader(io.StringIO(raw))
-
+        creds = json.loads(creds_json)
+        rows = import_google_sheet(creds, spreadsheet_id, range_name)
         added = 0
-        for row in reader:
-            phone = normalize_phone(row.get("phone") or row.get("Phone") or row.get("mobile") or row.get("Mobile"))
-            email = clean_text(row.get("email") or row.get("Email"))
-            name = clean_text(row.get("name") or row.get("full_name") or row.get("Name") or row.get("Full Name")) or "Unknown"
-
-            if not phone or dedupe_exists(db, phone, email):
-                continue
-
-            db.add(Lead(
-                full_name=name,
-                phone=phone,
-                email=email,
-                state="NEW",
-                created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow(),
-            ))
-            added += 1
-
+        for row in rows:
+            if _import_row(db, row):
+                added += 1
+        _log(db, None, None, "IMPORT_SHEET", f"imported={added}")
         db.commit()
         return {"imported": added}
     finally:
         db.close()
 
-
-# ============================================================
-# UI: DASHBOARD
-# ============================================================
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
+@app.post("/import/drive-csv")
+def import_drive(creds_json: str = Form(...), file_id: str = Form(...)):
     db = SessionLocal()
     try:
-        ensure_tables()
-
-        leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(50).all()
-
-        cards = ""
-        for l in leads:
-            hot = " 🔥" if needs_human(db, l.id) else ""
-            cards += f"""
-            <div style="background:#111827;padding:14px;margin:10px 0;border-radius:10px">
-              <b>{(l.full_name or "Unknown")}{hot}</b><br>
-              📞 {l.phone or "—"}<br>
-              ✉️ {l.email or "—"}<br>
-              <a href="/leads/{l.id}">View Lead →</a>
-            </div>
-            """
-
-        # simple upload form (CSV)
-        upload_box = """
-        <div style="margin-top:18px;padding:14px;border:1px solid #233044;border-radius:10px;background:#0f1624">
-          <h3 style="margin:0 0 10px 0;">Upload Leads (CSV)</h3>
-          <form action="/import/csv" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept=".csv" />
-            <button type="submit" style="margin-left:8px;">Upload</button>
-          </form>
-          <div style="opacity:0.75;margin-top:8px;font-size:13px;">Columns supported: name/full_name, phone, email</div>
-        </div>
-        """
-
-        return HTMLResponse(f"""
-        <html>
-        <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
-        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
-          <h1 style="margin:0 0 8px 0;">AgencyVault</h1>
-          <div style="margin-bottom:14px;">
-            <a href="/schedule">📅 Schedule</a>
-            &nbsp;|&nbsp;
-            <a href="/ai/run">🤖 Run AI Planner</a>
-          </div>
-
-          {upload_box}
-
-          <h3 style="margin-top:18px;">Latest Leads</h3>
-          {cards or "<p>No leads yet</p>"}
-        </body>
-        </html>
-        """)
-    finally:
-        db.close()
-
-
-# ============================================================
-# UI: LEAD DETAIL (never crashes if tables exist)
-# ============================================================
-@app.get("/leads/{lead_id}", response_class=HTMLResponse)
-def lead_detail(lead_id: int):
-    db = SessionLocal()
-    try:
-        ensure_ai_events_table()
-
-        lead = db.query(Lead).filter_by(id=lead_id).first()
-        if not lead:
-            return HTMLResponse("Not found", status_code=404)
-
-        # ---- AI MEMORY ----
-        mem = {
-            m.key: m.value
-            for m in db.query(LeadMemory)
-            .filter(LeadMemory.lead_id == lead.id)
-            .all()
-        }
-
-        # ---- TASKS ----
-        tasks = db.execute(text("""
-            SELECT task_type, status, due_at, notes, created_at
-            FROM ai_tasks
-            WHERE lead_id = :lead_id
-            ORDER BY created_at DESC
-            LIMIT 50
-        """), {"lead_id": lead.id}).fetchall()
-
-        task_html = ""
-        for t in tasks:
-            task_html += f"""
-            <div style="padding:8px 0;border-bottom:1px solid #222">
-              <b>{t.task_type}</b> [{t.status}]<br>
-              Due: {t.due_at or "now"}<br>
-              {t.notes or ""}
-            </div>
-            """
-
-        # ---- EVENTS / TRANSCRIPTS ----
-        events = db.execute(text("""
-            SELECT event_type, message, created_at
-            FROM ai_events
-            WHERE lead_id = :lead_id
-            ORDER BY created_at DESC
-            LIMIT 50
-        """), {"lead_id": lead.id}).fetchall()
-
-        event_html = ""
-        for e in events:
-            if e.event_type == "CALL_TRANSCRIPT":
-                event_html += f"""
-                <div style="margin:12px 0;padding:12px;background:#0f172a;border-radius:8px">
-                    <b>📞 Call Transcript</b><br>
-                    <pre style="white-space:pre-wrap;font-size:14px;line-height:1.4">
-{e.message}
-                    </pre>
-                </div>
-                """
-            else:
-                event_html += f"""
-                <div style="padding:6px 0;border-bottom:1px solid #222;opacity:0.85">
-                    {e.created_at} — <b>{e.event_type}</b><br>
-                    {e.message or ""}
-                </div>
-                """
-
-        return HTMLResponse(f"""
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width, initial-scale=1" />
-        </head>
-        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
-          <a href="/dashboard">← Back</a>
-
-          <h2 style="margin:10px 0 6px 0;">{lead.full_name or "Unknown"}</h2>
-          <div>📞 {lead.phone or "—"}</div>
-          <div>✉️ {lead.email or "—"}</div>
-
-          <h3 style="margin-top:18px;">AI Memory</h3>
-          <pre style="background:#0f1624;padding:12px;border-radius:10px;overflow:auto">
-{json.dumps(mem, indent=2)}
-          </pre>
-
-          <h3 style="margin-top:18px;">Tasks</h3>
-          <div style="background:#0f1624;padding:12px;border-radius:10px">
-            {task_html or "<div>No tasks yet</div>"}
-          </div>
-
-          <h3 style="margin-top:18px;">Activity</h3>
-          <div style="background:#0f1624;padding:12px;border-radius:10px">
-            {event_html or "<div>No activity yet</div>"}
-          </div>
-        </body>
-        </html>
-        """)
-
-    finally:
-        db.close()
-
-
-# ============================================================
-# AI RUN (Planner-only; safe for thousands)
-# ============================================================
-@app.get("/ai/run")
-def ai_run():
-    db = SessionLocal()
-    try:
-        ensure_tables()
-
-        # AI engine should only process small batches and return actions
-        actions = run_ai_engine(db, Lead) or []
-
-        planned = 0
-        now = datetime.utcnow()
-
-        for a in actions:
-            task_type = (a.get("type") or "CALL").upper()
-            lead_id = int(a["lead_id"])
-
-            # Make tasks visible + useful
-            confidence = a.get("confidence", "")
-            evidence = a.get("evidence", "") or a.get("notes", "") or "AI planned action"
-            due_at = a.get("due_at") or now
-
-            notes = f"Conf: {confidence} | {evidence}".strip(" |")
-
-            create_task(task_type, lead_id, notes=notes, due_at=due_at)
-            log_event(lead_id, "TASK_PLANNED", f"{task_type} | {notes}")
-            planned += 1
-
-            if a.get("needs_human"):
-                mem_set(db, lead_id, "needs_human", "1")
-
+        creds = json.loads(creds_json)
+        rows = import_drive_csv(creds, file_id)
+        added = 0
+        for row in rows:
+            if _import_row(db, row):
+                added += 1
+        _log(db, None, None, "IMPORT_DRIVE_CSV", f"imported={added}")
         db.commit()
-        return {"planned": planned}
+        return {"imported": added}
     finally:
         db.close()
 
-
-# ============================================================
-# SCHEDULE (FAST, SAFE, ALWAYS LIMITED)
-# ============================================================
-@app.get("/schedule", response_class=HTMLResponse)
-def schedule():
+@app.post("/import/google-doc")
+def import_doc(creds_json: str = Form(...), file_id: str = Form(...)):
     db = SessionLocal()
     try:
-        ensure_tables()
-
-        rows = db.execute(text("""
-            SELECT
-                t.id,
-                t.task_type,
-                t.lead_id,
-                t.status,
-                t.due_at,
-                t.notes,
-                t.attempt,
-                l.full_name,
-                l.phone,
-                l.email
-            FROM ai_tasks t
-            JOIN leads l ON l.id = t.lead_id
-            ORDER BY
-                CASE WHEN t.status='NEW' THEN 0 ELSE 1 END,
-                t.due_at NULLS FIRST,
-                t.id DESC
-            LIMIT 300
-        """)).fetchall()
-
-        html_rows = ""
-        for r in rows:
-            html_rows += f"""
-            <div style="padding:12px;margin:10px 0;border:1px solid #233044;border-radius:10px;background:#0f1624">
-              <div style="display:flex;justify-content:space-between;gap:10px;">
-                <div><b>{r.task_type}</b> <span style="opacity:0.8">[{r.status}]</span></div>
-                <div style="opacity:0.75;font-size:13px">Due: {r.due_at or "now"} | Attempts: {r.attempt}</div>
-              </div>
-              <div style="margin-top:6px"><b>{r.full_name or "Unknown"}</b></div>
-              <div style="opacity:0.9">📞 {r.phone or "-"}</div>
-              <div style="opacity:0.9">✉️ {r.email or "-"}</div>
-              <div style="margin-top:6px;opacity:0.9">Notes: {r.notes or "-"}</div>
-              <div style="margin-top:8px">
-                <a href="/leads/{r.lead_id}">Open lead</a>
-              </div>
-            </div>
-            """
-
-        return HTMLResponse(f"""
-        <html>
-        <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
-        <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px">
-          <a href="/dashboard">← Back</a>
-          <h2 style="margin:10px 0 14px 0;">Schedule</h2>
-          {html_rows or "<p>No tasks</p>"}
-        </body>
-        </html>
-        """)
+        creds = json.loads(creds_json)
+        text_data = import_google_doc_text(creds, file_id)
+        leads = parse_leads_from_text(text_data)
+        added = 0
+        for l in leads:
+            if _import_row(db, l):
+                added += 1
+        _log(db, None, None, "IMPORT_GOOGLE_DOC", f"imported={added}")
+        db.commit()
+        return {"imported": added}
     finally:
         db.close()
 
+# ---------------------------
+# Twilio: Voice TwiML
+# ---------------------------
+@app.get("/twilio/voice/twiml")
+@app.post("/twilio/voice/twiml")
+def twilio_twiml(lead_id: int | None = None):
+    db = SessionLocal()
+    try:
+        name = "there"
+        if lead_id:
+            lead = db.query(Lead).filter_by(id=lead_id).first()
+            if lead and lead.full_name:
+                parts = lead.full_name.split()
+                if parts and parts[0]:
+                    name = parts[0]
 
-# ============================================================
-# BACKGROUND TASK EXECUTOR (TEXT only, throttled, retries)
-# ============================================================
-def _task_executor_loop():
-    """
-    Sends TEXT tasks to the lead phone.
-    - Throttled to protect Twilio
-    - Marks FAILED with error if Twilio throws
-    - Never loops forever on bad leads
-    """
-    SEND_SLEEP_SECONDS = int(os.getenv("EXECUTOR_SLEEP_SECONDS", "90").strip() or "90")
-    MAX_ATTEMPTS = int(os.getenv("EXECUTOR_MAX_ATTEMPTS", "3").strip() or "3")
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Hi {name}. This is Nick’s office calling about the life insurance information you requested.</Say>
+  <Pause length="1"/>
+  <Say voice="alice">If now is not a good time, you can text us back and we will follow up.</Say>
+</Response>
+"""
+        return Response(content=twiml, media_type="text/xml")
+    finally:
+        db.close()
 
-    while True:
-        try:
-            ensure_tables()
-            db = SessionLocal()
-            try:
-                # Only due tasks, only NEW, only TEXT
-                tasks = db.execute(text("""
-                    SELECT id, lead_id, notes, attempt
-                    FROM ai_tasks
-                    WHERE status='NEW'
-                      AND task_type='TEXT'
-                      AND (due_at IS NULL OR due_at <= NOW())
-                    ORDER BY due_at NULLS FIRST, id ASC
-                    LIMIT 5
-                """)).fetchall()
+# ---------------------------
+# Twilio: Call Status
+# ---------------------------
+@app.post("/twilio/call/status")
+def twilio_call_status(CallSid: str = Form(...), CallStatus: str = Form(...)):
+    db = SessionLocal()
+    try:
+        lead_id = lead_id_for_call_sid(CallSid)
+        _log(db, lead_id, None, "CALL_STATUS", f"sid={CallSid} status={CallStatus}")
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
 
-                for t in tasks:
-                    lead = db.query(Lead).filter_by(id=t.lead_id).first()
-
-                    # Increment attempt early (so we see progress)
-                    db.execute(text("""
-                        UPDATE ai_tasks
-                        SET attempt = attempt + 1,
-                            updated_at = NOW()
-                        WHERE id = :id
-                    """), {"id": t.id})
-
-                    if not lead or not lead.phone:
-                        db.execute(text("""
-                            UPDATE ai_tasks
-                            SET status='DONE', last_error='missing lead/phone', updated_at=NOW()
-                            WHERE id=:id
-                        """), {"id": t.id})
-                        continue
-
-                    if (t.attempt or 0) >= MAX_ATTEMPTS:
-                        db.execute(text("""
-                            UPDATE ai_tasks
-                            SET status='FAILED', last_error='max attempts', updated_at=NOW()
-                            WHERE id=:id
-                        """), {"id": t.id})
-                        log_event(t.lead_id, "TEXT_FAILED", "Max attempts reached")
-                        continue
-
-                    greeting = greeting_for_lead(lead)
-
-                    # Message (no junk names)
-                    msg = (
-                        f"{greeting}, this is a quick follow-up on your life insurance request. "
-                        "I’ll be giving you a quick call shortly — no rush."
-                    )
-
-                    try:
-                        send_lead_sms(lead.phone, msg)
-
-                        db.execute(text("""
-                            UPDATE ai_tasks
-                            SET status='DONE', last_error=NULL, updated_at=NOW()
-                            WHERE id=:id
-                        """), {"id": t.id})
-
-                        log_event(lead.id, "TEXT_SENT", msg)
-
-                    except Exception as e:
-                        err = str(e)[:500]
-                        db.execute(text("""
-                            UPDATE ai_tasks
-                            SET last_error=:err,
-                                due_at = NOW() + INTERVAL '10 minutes',
-                                updated_at=NOW()
-                            WHERE id=:id
-                        """), {"id": t.id, "err": err})
-
-                        log_event(lead.id, "TEXT_ERROR", err)
-
-                db.commit()
-
-            finally:
-                db.close()
-
-        except Exception as e:
-            print("TASK EXECUTOR ERROR:", e)
-
-        time.sleep(SEND_SLEEP_SECONDS)
-
-
-@app.on_event("startup")
-def startup():
-    ensure_tables()
-
-    if os.getenv("ENABLE_AUTORUN", "0").strip() == "1":
-        threading.Thread(target=_task_executor_loop, daemon=True).start()
-        print("Task executor started.")
+# ---------------------------
+# Twilio: Recording
+# ---------------------------
 @app.post("/twilio/recording")
-async def twilio_recording_webhook(
-    RecordingSid: str = Form(...),
-    RecordingUrl: str = Form(...),
-    CallSid: str = Form(...),
+def twilio_recording(RecordingSid: str = Form(...), RecordingUrl: str = Form(...), CallSid: str = Form(...)):
+    db = SessionLocal()
+    try:
+        lead_id = lead_id_for_call_sid(CallSid)
+        # Twilio RecordingUrl usually needs extension to play
+        playable = (RecordingUrl or "").strip()
+        mp3 = playable + ".mp3" if playable and not playable.endswith(".mp3") else playable
+        _log(db, lead_id, None, "CALL_RECORDING", f"sid={CallSid} recordingSid={RecordingSid} url={playable} mp3={mp3}")
+        db.commit()
+        return {"ok": True}
+    finally:
+        db.close()
+
+# ---------------------------
+# Twilio: Inbound SMS (enterprise money-maker)
+# ---------------------------
+@app.post("/twilio/sms/inbound")
+def twilio_sms_inbound(
+    From: str = Form(...),
+    To: str = Form(...),
+    Body: str = Form(...),
+    MessageSid: str = Form("")
 ):
     db = SessionLocal()
     try:
-        # Ask Twilio for transcript
-        client = get_twilio_client()
-        recordings = client.recordings(RecordingSid).fetch()
+        from_phone = normalize_phone(From) or From
+        to_phone = normalize_phone(To) or To
+        body = (Body or "").strip()
 
-        if recordings.transcription_sid:
-            transcript = client.transcriptions(
-                recordings.transcription_sid
-            ).fetch()
-
-            # Save transcript
-            db.execute(text("""
-                INSERT INTO ai_events (lead_id, event_type, message)
-                VALUES (
-                    (SELECT lead_id FROM ai_tasks WHERE status='DONE' ORDER BY created_at DESC LIMIT 1),
-                    'CALL_TRANSCRIPT',
-                    :msg
-                )
-            """), {"msg": transcript.transcription_text})
-
+        lead = db.query(Lead).filter(Lead.phone == from_phone).first()
+        if not lead:
+            # Unknown inbound message: log only
+            _log(db, None, None, "SMS_IN_UNKNOWN", f"From={from_phone} Body={body}")
             db.commit()
+            return Response(content="<Response></Response>", media_type="text/xml")
 
-    except Exception as e:
-        print("TRANSCRIPTION ERROR:", e)
+        db.add(Message(
+            lead_id=lead.id,
+            direction="IN",
+            channel="SMS",
+            from_number=from_phone,
+            to_number=to_phone,
+            body=body,
+            provider_sid=MessageSid or "",
+        ))
+
+        _log(db, lead.id, None, "SMS_IN", body)
+
+        low = body.lower()
+
+        # Compliance: STOP / DNC
+        if any(x in low for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
+            lead.state = "DO_NOT_CONTACT"
+            lead.updated_at = _now()
+            cancel_pending_actions(db, lead.id, "Inbound STOP/DNC")
+            _log(db, lead.id, None, "COMPLIANCE_DNC", "Lead opted out via inbound SMS")
+            db.commit()
+            return Response(content="<Response></Response>", media_type="text/xml")
+
+        # Hot intent / escalation triggers
+        if any(x in low for x in ["call me", "ready", "yes", "now", "interested", "today"]):
+            lead.state = "CONTACTED"
+            lead.updated_at = _now()
+            _log(db, lead.id, None, "HOT_LEAD_DETECTED", body)
+            try:
+                send_alert_sms(f"🔥 HOT LEAD: {lead.full_name} {lead.phone} replied: {body}")
+            except Exception as e:
+                _log(db, lead.id, None, "ALERT_ERROR", str(e))
+            db.commit()
+            return Response(content="<Response></Response>", media_type="text/xml")
+
+        # Otherwise keep them WORKING and let planner continue
+        if lead.state == "NEW":
+            lead.state = "WORKING"
+        lead.updated_at = _now()
+        db.commit()
+        return Response(content="<Response></Response>", media_type="text/xml")
     finally:
         db.close()
-
-    return {"ok": True}
