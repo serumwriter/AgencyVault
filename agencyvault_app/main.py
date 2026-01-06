@@ -621,6 +621,7 @@ def dashboard():
       <a href="/actions">✅ Action Queue<small>Calls/texts planned</small></a>
       <a href="/activity">🧾 Activity Log<small>What AI did</small></a>
       <a href="/admin">🛡️ Admin<small>Mass delete + pause</small></a>
+      <a href="/uploads">⬆️ Upload Leads</a>
       <a href="/ai/plan">🤖 Run Planner<small>Create outreach actions</small></a>
     </div>
 
@@ -804,7 +805,6 @@ async function send() {
 def imports_page():
     return RedirectResponse("/dashboard#imports", status_code=303)
 # =========================
-# PART 2 of 2 — main.py (PASTE THIS SECOND, DIRECTLY UNDER PART 1)
 # =========================
 
 # =========================
@@ -1342,6 +1342,44 @@ async def admin_clear_actions(request: Request):
         return JSONResponse({"ok": True, "message": "Actions cleared."})
     finally:
         db.close()
+@app.get("/uploads", response_class=HTMLResponse)
+def uploads_page():
+    return HTMLResponse("""
+    <html>
+    <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:24px;max-width:900px;margin:0 auto;">
+      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">← Back</a>
+      <h2>⬆️ Upload Leads</h2>
+
+      <hr style="opacity:.2">
+
+      <h3>📄 Upload CSV</h3>
+      <form action="/import/csv" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".csv" required />
+        <br><br>
+        <button type="submit">Upload CSV</button>
+      </form>
+
+      <hr style="opacity:.2">
+
+      <h3>📕 Upload PDF</h3>
+      <form action="/import/pdf" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept="application/pdf" required />
+        <br><br>
+        <button type="submit">Upload PDF</button>
+      </form>
+
+      <hr style="opacity:.2">
+
+      <h3>🖼 Upload Image</h3>
+      <form action="/import/image" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept="image/*" required />
+        <br><br>
+        <button type="submit">Upload Image</button>
+      </form>
+
+    </body>
+    </html>
+    """)
 
 # =========================
 # Twilio Webhooks (SMS + Recordings)
