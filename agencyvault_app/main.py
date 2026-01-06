@@ -939,7 +939,9 @@ async def import_pdf(file: UploadFile = File(...)):
             db.commit()
             return RedirectResponse("/dashboard", status_code=303)
 
-        leads = parse_leads_from_text(text_data)
+        from .image_import import normalize_insurance_text
+
+        leads = normalize_insurance_text(text_data)
         added = 0
         for l in leads:
             if _import_row(db, l):
