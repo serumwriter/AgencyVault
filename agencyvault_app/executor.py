@@ -100,6 +100,7 @@ def run_executor_loop():
                 .limit(20)
                 .all()
             )
+             print("PENDING ACTIONS FOUND:", len(actions))
 
             executed = 0
 
