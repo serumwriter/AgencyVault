@@ -1,4 +1,3 @@
-# database.py (ROOT)
 import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
@@ -11,7 +10,7 @@ DATABASE_URL = _clean_database_url(os.getenv("DATABASE_URL"))
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing. Set it in Render environment variables.")
 
-# Force psycopg v3 driver (psycopg[binary])
+# Force psycopg v3 driver
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
