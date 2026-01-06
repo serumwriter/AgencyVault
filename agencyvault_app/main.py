@@ -1092,6 +1092,39 @@ def import_drive_image(creds_json: str = Form(...), file_id: str = Form(...)):
         return RedirectResponse("/dashboard", status_code=303)
     finally:
         db.close()
+# ============================================================
+# PDF UPLOAD
+# ============================================================
+
+@app.post("/import/pdf")
+async def import_pdf(file: UploadFile = File(...)):
+    db = SessionLocal()
+    try:
+        if not file.filename.lower().endswith(".pdf"):
+            return JSONResponse(
+                {"error": "Only PDF files are allowed"},
+                status_code=400
+            )
+
+        data = await file.read()
+        text_data = extract_text_from_pdf_bytes(data)
+
+        if not text_data.strip():
+            return {"imported": 0, "warning": "No readable text found in PDF"}
+
+        leads = parse_leads_from_text(text_data)
+
+        added = 0
+        for l in leads:
+            if _import_row(db, l):
+                added += 1
+
+        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
+        db.commit()
+        return {"imported": added}
+
+    finally:
+        db.close()
 
 # =========================
 # Leads: Add + List + Detail + Delete
