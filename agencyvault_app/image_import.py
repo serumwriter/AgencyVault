@@ -1,15 +1,40 @@
 from typing import List, Dict
 import re
 import io
-from PIL import Image
-import pytesseract
+
+# OCR is OPTIONAL — do not crash worker if missing
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
 
 def extract_text_from_image_bytes(data: bytes) -> str:
-    img = Image.open(io.BytesIO(data))
-    return pytesseract.image_to_string(img)
+    """
+    Safely extract text from image bytes.
+    If OCR is not available, return empty string instead of crashing.
+    """
+    if not OCR_AVAILABLE:
+        return ""
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
 
 def parse_leads_from_text(text: str) -> List[Dict[str, str]]:
+    """
+    Parse loose OCR text into leads.
+    Safe, best-effort only.
+    """
     leads: List[Dict[str, str]] = []
+    if not text:
+        return leads
+
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     buffer: Dict[str, str] = {}
 
@@ -38,4 +63,3 @@ def parse_leads_from_text(text: str) -> List[Dict[str, str]]:
         leads.append(buffer)
 
     return leads
-
