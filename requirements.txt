@@ -8,3 +8,4 @@ pytesseract
 google-api-python-client
 google-auth
 python-multipart
+httpx
