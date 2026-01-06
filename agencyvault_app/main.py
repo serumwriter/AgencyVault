@@ -304,7 +304,12 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
     if paused:
         return {"ok": False, "paused": True, "message": "AI work is PAUSED by operator."}
 
-    run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="")
+    run = AgentRun(
+        mode="planning",
+        status="STARTED",
+        batch_size=batch_size,
+        notes="Auto planner run",
+    )
     db.add(run)
     db.flush()
 
@@ -314,7 +319,10 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     leads = (
         db.query(Lead)
-        .filter(Lead.state == "NEW", Lead.phone.isnot(None))
+        .filter(
+            Lead.state == "NEW",
+            Lead.phone.isnot(None),
+        )
         .order_by(Lead.created_at.asc())
         .limit(batch_size)
         .all()
@@ -324,43 +332,64 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
         considered += 1
         first = safe_first_name(lead.full_name)
 
-        msg1 = (
+        # -------- TEXT ACTION --------
+        text_msg = (
             f"Hi{(' ' + first) if first else ''}, this is Nick's office. "
-            "You requested life insurance info before - totally okay if it's been a while. "
-            "Do you want help with a quick quote today?"
+            "You requested life insurance information. "
+            "Would you like a quick quote today?"
         )
+
         db.add(Action(
             lead_id=lead.id,
             type="TEXT",
             status="PENDING",
             tool="twilio",
-            payload_json=json.dumps({"to": lead.phone, "body": msg1}),
+            payload_json=json.dumps({
+                "message": text_msg
+            }),
             created_at=nowv,
         ))
         planned += 1
+
+        # -------- CALL ACTION (15 min later) --------
+        call_due = (nowv + timedelta(minutes=15)).isoformat()
 
         db.add(Action(
             lead_id=lead.id,
             type="CALL",
             status="PENDING",
             tool="twilio",
-            payload_json=json.dumps({"to": lead.phone, "lead_id": lead.id}),
+            payload_json=json.dumps({
+                "due_at": call_due
+            }),
             created_at=nowv,
         ))
         planned += 1
 
+        # Update lead state
         lead.state = "WORKING"
-        lead.last_contacted_at = nowv
         lead.updated_at = nowv
 
     run.status = "SUCCEEDED"
     run.finished_at = _now()
     db.commit()
 
-    _log(db, None, run.id, "AI_PLANNED", f"planned={planned} considered={considered}")
+    _log(
+        db,
+        None,
+        run.id,
+        "AI_PLANNED",
+        f"planned={planned} considered={considered}",
+    )
     db.commit()
 
-    return {"ok": True, "run_id": run.id, "planned_actions": planned, "considered": considered}
+    return {
+        "ok": True,
+        "run_id": run.id,
+        "planned_actions": planned,
+        "considered": considered,
+    }
+
 
 @app.get("/ai/plan")
 def ai_plan():
