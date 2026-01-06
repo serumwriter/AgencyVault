@@ -26,6 +26,36 @@ def extract_text_from_image_bytes(data: bytes) -> str:
         return ""
 
 
+def parse_pdf_lead_blocks(text: str) -> list[dict]:
+    leads = []
+    blocks = text.split("Inquiry Id:")
+
+    for block in blocks:
+        if "Phone:" not in block:
+            continue
+
+        def grab(label):
+            for line in block.splitlines():
+                if line.lower().startswith(label.lower()):
+                    return line.split(":", 1)[1].strip()
+            return None
+
+        lead = {
+            "first_name": grab("First Name"),
+            "last_name": grab("Last Name"),
+            "phone": grab("Phone"),
+            "email": grab("Email"),
+            "birthdate": grab("Date of Birth"),
+            "state": grab("State"),
+            "coverage_requested": grab("Desired Coverage Amount"),
+        }
+
+        # Require phone + at least first or last name
+        if lead["phone"] and (lead["first_name"] or lead["last_name"]):
+            leads.append(lead)
+
+    return leads
+    
 def parse_leads_from_text(text: str) -> List[Dict[str, str]]:
     """
     Parse loose OCR text into leads.
