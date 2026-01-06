@@ -63,3 +63,26 @@ def parse_leads_from_text(text: str) -> List[Dict[str, str]]:
         leads.append(buffer)
 
     return leads
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+
+from pypdf import PdfReader
+
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    """
+    Extract text from a PDF file.
+    Works for typed PDFs (forms, docs, exports).
+    """
+    text_chunks = []
+    reader = PdfReader(io.BytesIO(data))
+
+    for page in reader.pages:
+        try:
+            txt = page.extract_text()
+            if txt:
+                text_chunks.append(txt)
+        except Exception:
+            continue
+
+    return "\n".join(text_chunks)
