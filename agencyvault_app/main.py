@@ -1,3 +1,4 @@
+
 # agencyvault_app/main.py
 # AgencyVault - AI Employee Command Center (single-file, copy/paste)
 # RULES ENFORCED:
@@ -14,6 +15,7 @@ import io
 import json
 import os
 import re
+print("### AGENDA DEBUG: main.py LOADED ###")
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
