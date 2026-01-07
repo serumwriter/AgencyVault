@@ -430,6 +430,15 @@ def _first_match(pattern: str, text: str, flags=0) -> Optional[str]:
     val = (m.group(1) or "").strip()
     return val if val else None
 
+def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
+    rows = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead_id)
+        .order_by(LeadMemory.key.asc())
+        .all()
+    )
+    return {r.key: r.value for r in rows}
+
 def _extract_label(text: str, label: str) -> Optional[str]:
     """
     Extracts 'Label: value' where value is the rest of the line.
@@ -672,6 +681,15 @@ async def import_pdf(file: UploadFile = File(...)):
     finally:
         db.close()
     return True
+
+def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
+    rows = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead_id)
+        .order_by(LeadMemory.key.asc())
+        .all()
+    )
+    return {r.key: r.value for r in rows}
     
 # =========================
 # Health / Root / Service worker
@@ -890,6 +908,72 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     return {"ok": True, "run_id": run.id, "planned_actions": planned, "considered": considered}
 
+@app.get("/leads/{lead_id}", response_class=HTMLResponse)
+def lead_detail(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead:
+            return HTMLResponse("Lead not found", status_code=404)
+
+        mem = get_lead_memory_dict(db, lead.id)
+
+        def row(label, key):
+            val = mem.get(key)
+            if not val:
+                return ""
+            return f"""
+            <tr>
+              <td style="padding:6px 10px;color:rgba(230,237,243,.65)">{label}</td>
+              <td style="padding:6px 10px;font-weight:900">{val}</td>
+            </tr>
+            """
+
+        return HTMLResponse(f"""
+        <!doctype html>
+        <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Lead #{lead.id}</title>
+          <style>
+            body {{ margin:0; background:#0b0f17; color:#e6edf3; font-family:system-ui; }}
+            .wrap {{ max-width:820px; margin:20px auto; padding:18px; }}
+            .card {{ background:#0f1624; border:1px solid rgba(50,74,110,.25); border-radius:16px; padding:16px; }}
+            h2 {{ margin:0 0 6px 0; }}
+            .muted {{ opacity:.7; font-size:13px; }}
+            table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
+            tr {{ border-bottom:1px solid rgba(50,74,110,.2); }}
+            a {{ color:#8ab4f8; text-decoration:none; }}
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="card">
+              <h2>{lead.full_name or "Unknown"}</h2>
+              <div class="muted">{lead.phone} · {lead.email or "-"}</div>
+
+              <h3 style="margin-top:18px;">📞 Call Prep</h3>
+              <table>
+                {row("Tier", "tier")}
+                {row("Coverage", "coverage_requested")}
+                {row("Age", "age")}
+                {row("Smoker", "smoker")}
+                {row("Beneficiary", "beneficiary")}
+                {row("Source", "source_type")}
+                {row("Vendor", "source_vendor")}
+                {row("Notes", "notes")}
+              </table>
+
+              <div style="margin-top:16px;">
+                <a href="/dashboard">← Back to dashboard</a>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
+        """)
+    finally:
+        db.close()
 
 @app.get("/ai/plan")
 def ai_plan():
@@ -1444,6 +1528,49 @@ async def import_image(file: UploadFile = File(...)):
 # =========================
 # Leads: Add + List + Detail + Delete
 # =========================
+@app.get("/leads/{lead_id}")
+def lead_detail(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead:
+            return HTMLResponse("Lead not found", status_code=404)
+
+        mem = get_lead_memory_dict(db, lead.id)
+
+        def row(label, key):
+            val = mem.get(key)
+            if not val:
+                return ""
+            return f"<tr><td style='padding:4px 8px;color:#9fb3c8'>{label}</td><td style='padding:4px 8px;color:#e6edf3'><b>{val}</b></td></tr>"
+
+        html = f"""
+        <div style="max-width:700px;margin:20px auto;font-family:system-ui">
+          <h2>{lead.full_name}</h2>
+          <div style="opacity:.8">{lead.phone} · {lead.email or ""}</div>
+
+          <div style="margin-top:16px;padding:14px;border-radius:10px;background:#0f1624;border:1px solid #1f2a44">
+            <h3 style="margin-top:0">📞 Call Prep</h3>
+            <table>
+              {row("Tier", "tier")}
+              {row("Coverage", "coverage_requested")}
+              {row("Age", "age")}
+              {row("Smoker", "smoker")}
+              {row("Beneficiary", "beneficiary")}
+              {row("Source", "source_type")}
+              {row("Vendor", "source_vendor")}
+            </table>
+          </div>
+
+          <div style="margin-top:16px">
+            <a href="/dashboard" style="color:#7dd3fc">← Back to dashboard</a>
+          </div>
+        </div>
+        """
+        return HTMLResponse(html)
+    finally:
+        db.close()
+
 @app.get("/leads/new", response_class=HTMLResponse)
 def leads_new_form():
     return HTMLResponse("""
