@@ -415,7 +415,264 @@ def _import_row(db: Session, row: Dict[str, Any]) -> bool:
     )
 
     db.add(lead)
+import re
+import json
+from typing import Dict, Any, Optional
+
+# ---------- PDF Lead Parsing Helpers ----------
+
+_TIER_RE = re.compile(r"\b(BRONZE|SILVER|GOLD|PLATINUM)\b", re.IGNORECASE)
+
+def _first_match(pattern: str, text: str, flags=0) -> Optional[str]:
+    m = re.search(pattern, text, flags)
+    if not m:
+        return None
+    val = (m.group(1) or "").strip()
+    return val if val else None
+
+def _extract_label(text: str, label: str) -> Optional[str]:
+    """
+    Extracts 'Label: value' where value is the rest of the line.
+    Works even if there are extra spaces.
+    """
+    # Example: "First Name: Bobby"
+    pat = rf"{re.escape(label)}\s*:\s*(.+)"
+    return _first_match(pat, text, flags=re.IGNORECASE)
+
+def _extract_amount(text: str, label: str) -> Optional[str]:
+    """
+    Extract common money formats after a label, e.g. "$25,000" or "25000".
+    """
+    pat = rf"{re.escape(label)}\s*:\s*([$]?\s*[\d,]+)"
+    v = _first_match(pat, text, flags=re.IGNORECASE)
+    return v.replace(" ", "") if v else None
+
+def _extract_yesno(text: str, label: str) -> Optional[str]:
+    pat = rf"{re.escape(label)}\s*:\s*(Yes|No|Y|N|True|False)"
+    v = _first_match(pat, text, flags=re.IGNORECASE)
+    if not v:
+        return None
+    v2 = v.strip().lower()
+    if v2 in ("y", "yes", "true"):
+        return "Yes"
+    if v2 in ("n", "no", "false"):
+        return "No"
+    return v
+
+def _infer_tier_from_page(text: str) -> Optional[str]:
+    """
+    Looks for e.g. "BRONZE LIFE INQUIRY" anywhere on the page.
+    """
+    m = _TIER_RE.search(text or "")
+    return m.group(1).upper() if m else None
+
+def _parse_one_lead_from_page(page_text: str) -> Dict[str, Any]:
+    """
+    Deterministic extraction (no AI guessing).
+    Missing fields are allowed.
+    """
+    t = (page_text or "").strip()
+
+    # Tier/header classification
+    tier = _infer_tier_from_page(t)
+
+    inquiry_id = _extract_label(t, "Inquiry Id") or _extract_label(t, "Inquiry ID")
+
+    first = _extract_label(t, "First Name")
+    last = _extract_label(t, "Last Name")
+
+    # Some formats use "Name:" instead
+    if not first and not last:
+        name_line = _extract_label(t, "Name")
+        if name_line and " " in name_line:
+            parts = name_line.split()
+            first = parts[0]
+            last = " ".join(parts[1:])
+
+    # Contacts
+    phone_raw = _extract_label(t, "Phone") or _extract_label(t, "Mobile") or _extract_label(t, "Phone Number")
+    email = _extract_label(t, "Email") or _extract_label(t, "E-mail")
+
+    # Demographics
+    age = _extract_label(t, "Age")
+    dob = _extract_label(t, "Date of Birth") or _extract_label(t, "DOB")
+
+    # Address fields vary a lot; capture both line-style and labeled fields
+    addr1 = _extract_label(t, "Address") or _extract_label(t, "Street")
+    city = _extract_label(t, "City")
+    state = _extract_label(t, "State")
+    zipc = _extract_label(t, "Zip") or _extract_label(t, "ZIP")
+    county = _extract_label(t, "County")
+
+    # Underwriting / needs
+    smoker = _extract_yesno(t, "Is Smoker") or _extract_yesno(t, "Smoker")
+    height = _extract_label(t, "Height")
+    weight = _extract_label(t, "Weight")
+    beneficiary = _extract_label(t, "Beneficiary Name") or _extract_label(t, "Beneficiary")
+    military = _extract_yesno(t, "Is Military") or _extract_yesno(t, "Military")
+
+    # Coverage fields
+    requested = (
+        _extract_amount(t, "Current Coverage Amount")
+        or _extract_amount(t, "Coverage Amount")
+        or _extract_amount(t, "Requested Coverage")
+        or _extract_amount(t, "Face Value")
+    )
+
+    return {
+        "tier": tier,
+        "inquiry_id": inquiry_id,
+        "first_name": first,
+        "last_name": last,
+        "phone": phone_raw,
+        "email": email,
+        "age": age,
+        "dob": dob,
+        "address": addr1,
+        "city": city,
+        "us_state": state,
+        "zip": zipc,
+        "county": county,
+        "smoker": smoker,
+        "height": height,
+        "weight": weight,
+        "beneficiary": beneficiary,
+        "military": military,
+        "coverage_requested": requested,
+        "raw_text": t,
+    }
+
+def _mem_upsert(db, lead_id: int, key: str, value: str):
+    """
+    Upserts LeadMemory entries. Uses your UniqueConstraint(lead_id, key).
+    """
+    v = (value or "").strip()
+    if not v:
+        return
+
+    existing = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead_id, LeadMemory.key == key)
+        .first()
+    )
+    if existing:
+        existing.value = v
+        existing.updated_at = _now()
+    else:
+        db.add(LeadMemory(
+            lead_id=lead_id,
+            key=key,
+            value=v,
+            updated_at=_now(),
+        ))
+
+def _safe_full_name(first: Optional[str], last: Optional[str]) -> str:
+    f = clean_text(first or "")
+    l = clean_text(last or "")
+    name = (f"{f} {l}").strip()
+    return name if name else "Unknown"
+
+
+# ---------- PDF Import Endpoint (Immediate Import) ----------
+
+@app.post("/import/pdf")
+async def import_pdf(file: UploadFile = File(...)):
+    """
+    Immediate import:
+    - Each page => one Lead
+    - Missing fields allowed
+    - All extracted fields stored (Lead + LeadMemory)
+    """
+    if not PDF_OK:
+        return JSONResponse({"ok": False, "error": "PDF support not installed (pypdf missing)."}, status_code=400)
+
+    db = SessionLocal()
+    created = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        data = await file.read()
+        if not data:
+            return JSONResponse({"ok": False, "error": "Empty file"}, status_code=400)
+
+        reader = PdfReader(io.BytesIO(data))
+        total_pages = len(reader.pages)
+
+        for idx in range(total_pages):
+            try:
+                page_text = (reader.pages[idx].extract_text() or "").strip()
+                if not page_text:
+                    skipped += 1
+                    continue
+
+                parsed = _parse_one_lead_from_page(page_text)
+
+                # Normalize key fields
+                phone = normalize_phone(parsed.get("phone") or "")
+                email = clean_text(parsed.get("email") or "")
+                full_name = _safe_full_name(parsed.get("first_name"), parsed.get("last_name"))
+
+                # If the page truly has no contact info, still create a lead (your requirement),
+                # but mark it so it can be reviewed.
+                tz = infer_timezone_from_phone(phone) if phone else None
+
+                # Dedupe: only when we have enough to dedupe
+                if phone and dedupe_exists(db, phone, email):
+                    skipped += 1
+                    continue
+
+                lead = Lead(
+                    full_name=full_name,
+                    phone=phone or "UNKNOWN",   # keep row valid if phone missing
+                    email=email or None,
+                    state="NEW",
+                    timezone=tz,
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+                db.add(lead)
+                db.flush()  # get lead.id
+
+                # Store all call-critical info into memory (only if present)
+                _mem_upsert(db, lead.id, "source_type", "pdf_inquiry")
+                _mem_upsert(db, lead.id, "source_filename", clean_text(file.filename or "uploaded.pdf"))
+                _mem_upsert(db, lead.id, "pdf_page_number", str(idx + 1))
+
+                for k in [
+                    "tier", "inquiry_id", "age", "dob", "address", "city", "us_state", "zip",
+                    "county", "smoker", "height", "weight", "beneficiary", "military",
+                    "coverage_requested"
+                ]:
+                    v = parsed.get(k)
+                    if v is not None:
+                        _mem_upsert(db, lead.id, k, str(v))
+
+                # Optional: store raw page text (can be long; keep it if you want)
+                raw = parsed.get("raw_text") or ""
+                if raw:
+                    _mem_upsert(db, lead.id, "raw_pdf_text", raw[:12000])
+
+                _log(db, lead.id, None, "LEAD_IMPORTED_PDF", f"page={idx+1} name={full_name} phone={phone or '-'}")
+                created += 1
+
+            except Exception as e:
+                errors += 1
+                _log(db, None, None, "PDF_PAGE_IMPORT_ERROR", f"page={idx+1} err={str(e)[:300]}")
+
+        db.commit()
+        return {
+            "ok": True,
+            "pages": total_pages,
+            "created": created,
+            "skipped": skipped,
+            "errors": errors,
+        }
+
+    finally:
+        db.close()
     return True
+    
 # =========================
 # Health / Root / Service worker
 # =========================
