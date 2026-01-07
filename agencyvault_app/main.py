@@ -1053,7 +1053,7 @@ def _svg_donut(pct: float) -> str:
 # =========================
 # Dashboard
 # =========================
-@app.post("/worker/execute")
+@app.get("/worker/execute")
 def worker_execute(limit: int = 5):
     db = SessionLocal()
     try:
