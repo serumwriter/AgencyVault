@@ -617,6 +617,52 @@ def worker_execute(limit: int = 5):
     finally:
         db.close()
 
+def render_action(a):
+    l = leads.get(a.lead_id)
+    p = _parse_payload(a)
+    phone = (l.phone if l else "") or "-"
+    name = (l.full_name if l else "") or f"Lead #{a.lead_id}"
+    msg = p.get("message") if a.type == "TEXT" else ""
+    when = p.get("when") or ""
+    reason = p.get("reason") or ""
+
+    if a.type == "CALL":
+        todo = f"CALL this person manually: {phone}"
+    elif a.type == "TEXT":
+        todo = f"TEXT this person manually: {phone}"
+    else:
+        todo = f"APPOINTMENT: {when}"
+
+    msg_html = ""
+    if msg:
+        msg_html = f'<div class="muted" style="margin-top:6px;white-space:pre-wrap">{msg}</div>'
+
+    return f"""
+    <div class="item">
+      <div class="top">
+        <div class="name"><a href="/leads/{a.lead_id}">#{a.lead_id} {name}</a></div>
+        <div class="tag">{a.type}</div>
+      </div>
+
+      <div class="muted"><b>DO THIS:</b> {todo}</div>
+      <div class="muted">Reason: {reason or "-"}</div>
+      {msg_html}
+
+      <form method="post" action="/agenda/report" style="margin-top:10px">
+        <input type="hidden" name="action_id" value="{a.id}" />
+
+        <textarea name="note" placeholder="Paste what they said or write quick notes (AI will decide next step)"
+          style="width:100%;min-height:70px;margin-top:6px"></textarea>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+          <button class="btn" name="outcome" value="talked">Talked / Replied</button>
+          <button class="btn" name="outcome" value="no_answer">No answer</button>
+          <button class="btn" name="outcome" value="not_interested">Not interested</button>
+          <button class="btn" name="outcome" value="booked">Booked (verbal yes)</button>
+        </div>
+      </form>
+    </div>
+    """
 
 # =========================
 # Planner (creates PENDING actions)
