@@ -758,6 +758,58 @@ def _upcoming_appts(db: Session, limit: int = 8) -> List[Dict[str, str]]:
 # =========================
 # Dashboard (mobile-safe, no sideways scroll)
 # =========================
+from sqlalchemy import or_
+
+def _get_mem_map(db: Session, lead_ids: List[int]) -> Dict[int, Dict[str, str]]:
+    """
+    Fetch LeadMemory for a set of leads in one query.
+    Returns {lead_id: {key: value}}
+    """
+    if not lead_ids:
+        return {}
+    rows = db.query(LeadMemory).filter(LeadMemory.lead_id.in_(lead_ids)).all()
+    out: Dict[int, Dict[str, str]] = {}
+    for r in rows:
+        out.setdefault(r.lead_id, {})[r.key] = r.value
+    return out
+
+def _upcoming_appts(db: Session, limit: int = 8) -> List[Dict[str, Any]]:
+    """
+    Simple local "calendar" until Google Calendar sync is enabled.
+    Convention: LeadMemory key 'appt_time' = ISO string, and optional 'appt_note'.
+    """
+    # This is intentionally conservative and won't crash if no rows exist.
+    rows = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.key == "appt_time")
+        .order_by(LeadMemory.updated_at.desc().nullslast())
+        .limit(200)
+        .all()
+    )
+    items = []
+    for r in rows:
+        try:
+            lead = db.query(Lead).filter(Lead.id == r.lead_id).first()
+            if not lead:
+                continue
+            note = mem_get(db, lead.id, "appt_note") or ""
+            tz = lead.timezone or (os.getenv("DEFAULT_TIMEZONE") or "America/Denver")
+            when = (r.value or "").strip()
+            if not when:
+                continue
+            items.append({
+                "lead_id": lead.id,
+                "name": lead.full_name or "Unknown",
+                "when": when,
+                "tz": tz,
+                "note": note[:180],
+            })
+        except Exception:
+            continue
+        if len(items) >= limit:
+            break
+    return items
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db = SessionLocal()
@@ -768,27 +820,33 @@ def dashboard():
         contacted = db.query(Lead).filter(Lead.state == "CONTACTED").count()
         dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
         pending = db.query(Action).filter(Action.status == "PENDING").count()
+        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
 
+        # Activity feed (safe + limited)
         logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(18).all()
         feed = ""
         for l in logs:
             feed += f"""
             <div class="feed-item">
               <div class="feed-top">
-                <div class="feed-title">{l.event}</div>
+                <div class="feed-title">{(l.event or "")}</div>
                 <div class="feed-time">{str(l.created_at)[:19]}</div>
               </div>
               <div class="feed-meta">lead={l.lead_id} run={l.run_id}</div>
-              <div class="feed-body">{(l.detail or "")[:260]}</div>
+              <div class="feed-body">{(l.detail or "")[:280]}</div>
             </div>
             """
 
-        leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(10).all()
+        # Newest leads
+        leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(12).all()
+        lead_ids = [x.id for x in leads]
+        mem_map = _get_mem_map(db, lead_ids)
+
         leads_html = ""
         for l in leads:
-            mem = {m.key: m.value for m in db.query(LeadMemory).filter(LeadMemory.lead_id == l.id).all()}
+            mem = mem_map.get(l.id, {})
             us_state = mem.get("us_state") or mem.get("state") or "-"
-            cov = mem.get("coverage_requested") or "-"
+            cov = mem.get("coverage_requested") or mem.get("coverage") or "-"
             tier = mem.get("tier") or "-"
             prod = mem.get("product_interest") or mem.get("coverage_type") or "-"
             leads_html += f"""
@@ -816,6 +874,7 @@ def dashboard():
         pct_contacted = (contacted / denom) * 100.0
         pct_dnc = (dnc / denom) * 100.0
 
+        # Calendar panel (local memory now, Google sync later)
         appts = _upcoming_appts(db, limit=8)
         appt_html = ""
         for a in appts:
@@ -823,13 +882,30 @@ def dashboard():
             <div class="appt">
               <div class="appt-top">
                 <div class="appt-title"><a href="/leads/{a["lead_id"]}">#{a["lead_id"]} {a["name"]}</a></div>
-                <div class="appt-when">{a["when"]} {a["tz"]}</div>
+                <div class="appt-when">{a["when"]} ({a["tz"]})</div>
               </div>
               <div class="appt-note">{a["note"] or ""}</div>
             </div>
             """
         if not appt_html:
-            appt_html = '<div class="muted">No appointments stored yet. (Google sync will slot in here.)</div>'
+            appt_html = '<div class="muted">No appointments stored yet. Google Calendar sync will appear here.</div>'
+
+        pause_label = "Paused" if paused else "Running"
+
+        def svg_donut(pct: float) -> str:
+            pct = max(0.0, min(100.0, pct))
+            r = 16
+            c = 2 * 3.14159 * r
+            dash = (pct / 100.0) * c
+            gap = c - dash
+            return f"""
+            <svg width="44" height="44" viewBox="0 0 44 44" aria-label="{pct:.0f}%">
+              <circle cx="22" cy="22" r="{r}" fill="none" stroke="rgba(138,180,248,.15)" stroke-width="6"></circle>
+              <circle cx="22" cy="22" r="{r}" fill="none" stroke="rgba(138,180,248,.95)" stroke-width="6"
+                      stroke-dasharray="{dash:.2f} {gap:.2f}" transform="rotate(-90 22 22)"></circle>
+              <text x="22" y="25" text-anchor="middle" font-size="10" fill="rgba(230,237,243,.85)">{pct:.0f}%</text>
+            </svg>
+            """
 
         return HTMLResponse(f"""
 <!doctype html>
@@ -848,33 +924,108 @@ def dashboard():
     --link:#8ab4f8;
   }}
   * {{ box-sizing:border-box; }}
-  body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; overflow-x:hidden; }}
+  body {{
+    margin:0;
+    background:var(--bg);
+    color:var(--text);
+    font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
+    overflow-x:hidden; /* prevents sideways scroll */
+  }}
   a {{ color:var(--link); text-decoration:none; }}
   a:hover {{ text-decoration:underline; }}
 
-  .wrap {{ display:grid; grid-template-columns: 260px 1fr; min-height:100vh; }}
-  .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; position:sticky; top:0; height:100vh; overflow:auto;
-             background:linear-gradient(180deg, rgba(17,24,39,.55), rgba(11,15,23,.55)); }}
-  .brand {{ font-weight:900; letter-spacing:.2px; font-size:20px; margin-bottom:6px; }}
+  .wrap {{
+    display:grid;
+    grid-template-columns: 260px 1fr;
+    min-height:100vh;
+    width:100%;
+  }}
+  .sidebar {{
+    border-right:1px solid var(--border);
+    padding:16px 14px;
+    position:sticky;
+    top:0;
+    height:100vh;
+    overflow:auto;
+    background:linear-gradient(180deg, rgba(17,24,39,.55), rgba(11,15,23,.55));
+  }}
+  .brand {{ font-weight:900; font-size:20px; margin-bottom:6px; }}
   .subtitle {{ color:var(--muted); font-size:13px; }}
   .nav {{ display:flex; flex-direction:column; gap:8px; margin-top:14px; }}
-  .nav a {{ display:block; padding:10px 12px; border-radius:12px; border:1px solid rgba(50,74,110,.15); background:rgba(15,22,36,.55); }}
+  .nav a {{
+    display:block;
+    padding:10px 12px;
+    border-radius:12px;
+    border:1px solid rgba(50,74,110,.15);
+    background:rgba(15,22,36,.55);
+  }}
   .nav a:hover {{ border-color:rgba(138,180,248,.55); }}
 
-  .main {{ padding:18px; max-width:1200px; width:100%; }}
-  .topbar {{ display:flex; justify-content:space-between; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-bottom:14px; }}
+  .main {{
+    padding:18px;
+    width:100%;
+    max-width:1250px;
+  }}
+
+  .topbar {{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-end;
+    gap:14px;
+    flex-wrap:wrap;
+    margin-bottom:14px;
+  }}
   .title {{ font-size:26px; font-weight:900; }}
   .sub {{ color:var(--muted); font-size:13px; }}
 
-  .kpis {{ display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:10px; margin-top:12px; }}
-  .kpi {{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:12px; min-width:0; }}
+  .kpis {{
+    display:grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap:10px;
+    margin-top:12px;
+  }}
+  .kpi {{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:16px;
+    padding:12px;
+    min-width:0;
+  }}
   .kpi-label {{ color:var(--muted); font-size:12px; }}
   .kpi-value {{ font-size:22px; font-weight:900; margin-top:2px; }}
   .kpi-sub {{ color:var(--muted); font-size:12px; margin-top:4px; }}
 
-  .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px; }}
-  .panel {{ background:var(--panel); border:1px solid var(--border); border-radius:18px; padding:14px; min-width:0; }}
+  .grid {{
+    display:grid;
+    grid-template-columns: 1fr 1fr;
+    gap:12px;
+    margin-top:12px;
+  }}
+  .panel {{
+    background:var(--panel);
+    border:1px solid var(--border);
+    border-radius:18px;
+    padding:14px;
+    min-width:0;
+  }}
   .panel h2 {{ margin:0 0 10px 0; font-size:16px; font-weight:900; letter-spacing:.2px; }}
+
+  .donuts {{
+    display:grid;
+    grid-template-columns: repeat(2, minmax(0,1fr));
+    gap:10px;
+  }}
+  .donut-card {{
+    background:var(--panel2);
+    border:1px solid var(--border);
+    border-radius:16px;
+    padding:12px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:10px;
+    min-width:0;
+  }}
 
   .feed-item {{ padding:10px 0; border-bottom:1px solid var(--border); }}
   .feed-top {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
@@ -883,27 +1034,80 @@ def dashboard():
   .feed-meta {{ color:var(--muted); font-size:12px; margin-top:2px; }}
   .feed-body {{ margin-top:6px; color:rgba(230,237,243,.9); }}
 
-  .lead-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }}
+  .lead-row {{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-start;
+    gap:12px;
+    padding:10px 0;
+    border-bottom:1px solid var(--border);
+  }}
   .lead-main {{ min-width:0; }}
   .lead-name {{ font-weight:900; }}
-  .lead-meta {{ color:var(--muted); font-size:12px; margin-top:2px; word-break:break-word; }}
-  .lead-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
-  .pill {{ padding:3px 9px; border-radius:999px; border:1px solid rgba(138,180,248,.25); background:rgba(17,24,39,.6); font-size:12px; color:rgba(230,237,243,.9); }}
+  .lead-meta {{
+    color:var(--muted);
+    font-size:12px;
+    margin-top:2px;
+    word-break:break-word;
+  }}
+  .lead-actions {{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    flex-wrap:wrap;
+    justify-content:flex-end;
+  }}
+  .pill {{
+    padding:3px 9px;
+    border-radius:999px;
+    border:1px solid rgba(138,180,248,.25);
+    background:rgba(17,24,39,.6);
+    font-size:12px;
+    color:rgba(230,237,243,.9);
+  }}
 
-  .btn {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:10px 12px; border-radius:12px;
-         border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text); cursor:pointer; text-decoration:none; font-weight:800; }}
-  .btn:hover {{ border-color:rgba(138,180,248,.6); }}
-  .mini {{ padding:7px 10px; border-radius:10px; border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text);
-          cursor:pointer; font-weight:900; font-size:12px; }}
+  .btn, .mini {{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    gap:8px;
+    border-radius:12px;
+    border:1px solid rgba(50,74,110,.35);
+    background:rgba(17,24,39,.75);
+    color:var(--text);
+    cursor:pointer;
+    font-weight:900;
+  }}
+  .btn {{ padding:10px 12px; }}
+  .mini {{ padding:7px 10px; border-radius:10px; font-size:12px; }}
 
-  textarea {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:14px;
-            padding:12px; min-height:110px; font-size:14px; outline:none; }}
-  pre {{ white-space:pre-wrap; margin:10px 0 0 0; color:rgba(230,237,243,.9); font-size:13px; }}
-  input {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:12px; padding:10px; outline:none; }}
+  textarea {{
+    width:100%;
+    background:rgba(11,15,23,.75);
+    color:var(--text);
+    border:1px solid rgba(50,74,110,.35);
+    border-radius:14px;
+    padding:12px;
+    min-height:110px;
+    font-size:14px;
+    outline:none;
+  }}
+  pre {{
+    white-space:pre-wrap;
+    margin:10px 0 0 0;
+    color:rgba(230,237,243,.9);
+    font-size:13px;
+  }}
+  input {{
+    width:100%;
+    background:rgba(11,15,23,.75);
+    color:var(--text);
+    border:1px solid rgba(50,74,110,.35);
+    border-radius:12px;
+    padding:10px;
+    outline:none;
+  }}
   .muted {{ color:var(--muted); font-size:12px; }}
-
-  .donuts {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }}
-  .donut-card {{ background:var(--panel2); border:1px solid var(--border); border-radius:16px; padding:12px; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
 
   .appt {{ padding:10px 0; border-bottom:1px solid rgba(50,74,110,.22); }}
   .appt-top {{ display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }}
@@ -916,6 +1120,7 @@ def dashboard():
     .sidebar {{ position:relative; height:auto; border-right:none; }}
     .kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     .grid {{ grid-template-columns: 1fr; }}
+    .main {{ max-width:100%; }}
   }}
 </style>
 </head>
@@ -933,11 +1138,12 @@ def dashboard():
       <a href="/actions">Action Queue</a>
       <a href="/activity">Activity Log</a>
       <a href="/ai/plan">Run Planner</a>
-      <a href="/worker/execute?limit=5">Run Worker (Execute)</a>
+      <a href="/worker/execute?limit=5">Execute Now</a>
     </div>
 
     <div style="margin-top:14px" class="muted">
-      Imports are on the dashboard. Phone is mandatory.
+      Status: <b>{pause_label}</b><br>
+      Phone is mandatory. Imports + outreach are designed to not crash.
     </div>
   </aside>
 
@@ -955,27 +1161,27 @@ def dashboard():
     </div>
 
     <div class="kpis">
-      {_kpi_card("Total Leads", total, "All time")}
-      {_kpi_card("NEW", new, "Not touched yet")}
-      {_kpi_card("WORKING", working, "In outreach")}
-      {_kpi_card("CONTACTED", contacted, "Hot replies / progressed")}
-      {_kpi_card("DNC", dnc, "Compliance")}
-      {_kpi_card("Pending Actions", pending, "Queued")}
+      <div class="kpi"><div class="kpi-label">Total</div><div class="kpi-value">{total}</div><div class="kpi-sub">All time</div></div>
+      <div class="kpi"><div class="kpi-label">NEW</div><div class="kpi-value">{new}</div><div class="kpi-sub">Not touched</div></div>
+      <div class="kpi"><div class="kpi-label">WORKING</div><div class="kpi-value">{working}</div><div class="kpi-sub">Outreach running</div></div>
+      <div class="kpi"><div class="kpi-label">CONTACTED</div><div class="kpi-value">{contacted}</div><div class="kpi-sub">Replied / progressed</div></div>
+      <div class="kpi"><div class="kpi-label">DNC</div><div class="kpi-value">{dnc}</div><div class="kpi-sub">Compliance</div></div>
+      <div class="kpi"><div class="kpi-label">Pending</div><div class="kpi-value">{pending}</div><div class="kpi-sub">Queued actions</div></div>
     </div>
 
     <div class="grid">
       <div class="panel">
         <h2>Distribution</h2>
         <div class="donuts">
-          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div>{_svg_donut(pct_new)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div>{_svg_donut(pct_working)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div>{_svg_donut(pct_contacted)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div>{_svg_donut(pct_dnc)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div>{svg_donut(pct_new)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div>{svg_donut(pct_working)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div>{svg_donut(pct_contacted)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div>{svg_donut(pct_dnc)}</div>
         </div>
       </div>
 
       <div class="panel">
-        <h2>Imports (No Guessing)</h2>
+        <h2>Imports</h2>
 
         <div class="muted" style="margin-bottom:8px;">Upload CSV</div>
         <form action="/import/csv" method="post" enctype="multipart/form-data">
@@ -983,33 +1189,33 @@ def dashboard():
           <div style="margin-top:8px;"><button class="btn" type="submit">Upload CSV</button></div>
         </form>
 
-        <div class="muted" style="margin:14px 0 8px;">Upload PDF (typed PDFs)</div>
+        <div class="muted" style="margin:14px 0 8px;">Upload PDF</div>
         <form action="/import/pdf" method="post" enctype="multipart/form-data">
           <input type="file" name="file" accept=".pdf,application/pdf" />
           <div style="margin-top:8px;"><button class="btn" type="submit">Upload PDF</button></div>
         </form>
 
-        <div class="muted" style="margin:14px 0 8px;">Upload Image (JPG/PNG)</div>
+        <div class="muted" style="margin:14px 0 8px;">Upload Image</div>
         <form action="/import/image" method="post" enctype="multipart/form-data">
           <input type="file" name="file" accept="image/*" />
           <div style="margin-top:8px;"><button class="btn" type="submit">Upload Image</button></div>
         </form>
 
         <div class="muted" style="margin-top:12px;">
-          Notes: Phone is mandatory. If Twilio is blocked (10DLC), actions will show FAILED with the real error.
+          If Twilio is blocked (10DLC), actions will show FAILED with the real error. Nothing will crash.
         </div>
       </div>
 
       <div class="panel">
-        <h2>Newest Leads (Text/Call buttons)</h2>
+        <h2>Newest Leads (Text/Call)</h2>
         <div>{leads_html or '<div class="muted">No leads yet.</div>'}</div>
       </div>
 
       <div class="panel">
-        <h2>Calendar (Easy to see)</h2>
+        <h2>Calendar</h2>
         {appt_html}
         <div style="margin-top:10px" class="muted">
-          Google Calendar sync is scaffolded: once OAuth is added, appts will push automatically.
+          Google Calendar sync will go here. Once connected, AI will not schedule over existing blocks.
         </div>
       </div>
 
@@ -1019,51 +1225,113 @@ def dashboard():
       </div>
 
       <div class="panel">
-        <h2>AI Employee (Offline-first)</h2>
-        <div class="muted">Commands: counts | run planner | execute | lead 123 | wake rules</div>
+        <h2>AI Employee</h2>
+        <div class="muted">Commands: counts | run planner | execute | lead 123</div>
         <textarea id="cmd" placeholder="Try: counts"></textarea>
         <div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">
-          <button class="btn" onclick="send()">Send</button>
-          <button class="btn" onclick="document.getElementById('cmd').value='counts'; send();">Counts</button>
-          <button class="btn" onclick="document.getElementById('cmd').value='run planner'; send();">Run Planner</button>
-          <button class="btn" onclick="document.getElementById('cmd').value='execute'; send();">Execute</button>
+          <button class="btn" onclick="sendCmd()">Send</button>
+          <button class="btn" onclick="preset('counts')">Counts</button>
+          <button class="btn" onclick="preset('run planner')">Run Planner</button>
+          <button class="btn" onclick="preset('execute')">Execute</button>
         </div>
         <pre id="out" class="muted"></pre>
 
         <div style="margin-top:10px" class="muted">
-          Live call screen + transcript: requires Twilio Media Streams + a websocket service.
-          This build includes placeholders and logging now; we wire live transcript next.
+          Live call + transcript requires Twilio Media Streams + a websocket service.
+          Dashboard is ready for it; we wire that next.
         </div>
       </div>
-
     </div>
   </main>
 </div>
 
 <script>
-async function send() {
+function preset(v) {{
+  document.getElementById("cmd").value = v;
+  sendCmd();
+}}
+
+async function sendCmd() {{
   const msg = document.getElementById("cmd").value;
   const out = document.getElementById("out");
   out.textContent = "Working...";
-  try {
-    const r = await fetch("/api/assistant", {
+  try {{
+    const r = await fetch("/api/assistant", {{
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: msg })
-    });
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify({{ message: msg }})
+    }});
     const d = await r.json();
     out.textContent = d.reply || "OK";
-  } catch (e) {
-    out.textContent = "Error: " + e;
-  }
-}
+  }} catch (e) {{
+    out.textContent = "Error talking to assistant.";
+  }}
+}}
 </script>
+
 </body>
 </html>
         """)
     finally:
         db.close()
 
+@app.post("/leads/{lead_id}/text-now")
+def text_now(lead_id: int):
+    """
+    Immediate operator-triggered text:
+    Creates a PENDING TEXT action so the worker executes it (no blocking).
+    """
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead or not (lead.phone or "").strip():
+            return RedirectResponse("/dashboard", status_code=303)
+
+        first = safe_first_name(lead.full_name)
+        msg = (
+            f"Hi{(' ' + first) if first else ''}, this is Nick's office. "
+            "You requested life insurance info — want a quick quote today?"
+        )
+
+        db.add(Action(
+            lead_id=lead.id,
+            type="TEXT",
+            status="PENDING",
+            tool="twilio",
+            payload_json=json.dumps({"to": lead.phone, "message": msg}),
+            created_at=_now(),
+        ))
+        _log(db, lead.id, None, "TEXT_NOW_QUEUED", msg[:400])
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
+
+@app.post("/leads/{lead_id}/call-now")
+def call_now(lead_id: int):
+    """
+    Immediate operator-triggered call:
+    Creates a PENDING CALL action so the worker executes it (no blocking).
+    """
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead or not (lead.phone or "").strip():
+            return RedirectResponse("/dashboard", status_code=303)
+
+        db.add(Action(
+            lead_id=lead.id,
+            type="CALL",
+            status="PENDING",
+            tool="twilio",
+            payload_json=json.dumps({"to": lead.phone, "lead_id": lead.id, "due_at": _now().isoformat()}),
+            created_at=_now(),
+        ))
+        _log(db, lead.id, None, "CALL_NOW_QUEUED", f"to={lead.phone}")
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
 
 # =========================
 # Imports (ONE route each)
