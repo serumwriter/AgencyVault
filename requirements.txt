@@ -10,3 +10,6 @@ google-auth
 python-multipart
 httpx
 pypdf
+google-auth
+google-auth-oauthlib
+google-api-python-client
