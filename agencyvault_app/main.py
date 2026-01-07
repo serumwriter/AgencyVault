@@ -1,10 +1,21 @@
+# agencyvault_app/main.py
+# AgencyVault - AI Employee Command Center (single-file, copy/paste)
+# RULES ENFORCED:
+# - Phone is mandatory for a Lead (imports skip rows without a valid phone)
+# - Lead table stays minimal; ALL extra fields go into LeadMemory
+# - CSV + PDF + Image imports normalize into one pipeline
+# - No schema breakage from vendor fields (us_state/coverage/etc stored in LeadMemory)
+# - Buttons: Text Now / Call Now (creates actions + tries to send immediately)
+# - Worker endpoint executes PENDING actions with timezone + quiet-hours rules
+# - Calendar panel: shows upcoming "appointment" memory entries (Google sync stub included)
+
 import csv
 import io
 import json
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, UploadFile, File, Form, Request
@@ -14,16 +25,9 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from .database import engine, SessionLocal
-from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message, Task
+from .models import Base, Lead, LeadMemory, Action, AgentRun, AuditLog, Message
 
-# Optional Google imports (if you already have google_drive_import.py)
-try:
-    from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
-    GOOGLE_IMPORTS_OK = True
-except Exception:
-    GOOGLE_IMPORTS_OK = False
-
-# Twilio functions (handle multiple possible names)
+# Twilio client functions (must exist in your codebase)
 from .twilio_client import send_alert_sms, send_lead_sms
 
 try:
@@ -33,7 +37,6 @@ except Exception:
         from .twilio_client import make_call as _make_call
     except Exception:
         _make_call = None
-
 
 # Optional PDF extraction
 try:
@@ -51,7 +54,7 @@ except Exception:
     OCR_OK = False
 
 
-app = FastAPI(title="AgencyVault - Command Center")
+app = FastAPI(title="AgencyVault - AI Employee")
 
 
 # =========================
@@ -63,16 +66,25 @@ def _startup():
 
 
 # =========================
-# Normalization / Sanitization
+# Core helpers / sanitization
 # =========================
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-_US_STATE_RE = re.compile(r"^(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)$", re.I)
+_US_STATE_RE = re.compile(
+    r"^(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)$",
+    re.I,
+)
 
 BAD_NAME_WORDS = {
-    "lead", "bronze", "silver", "gold", "ethos",
-    "facebook", "insurance", "prospect", "unknown", "test",
-    "meta", "client", "customer", "applicant"
+    "lead", "bronze", "silver", "gold", "platinum", "ethos", "goat",
+    "fresh", "aged", "new", "facebook", "insurance", "prospect", "unknown",
+    "meta", "client", "customer", "applicant", "iul", "term", "whole", "life",
+    "mortgage", "final", "expense", "annuity", "inquiry"
 }
+
+TIER_WORDS = {"bronze", "silver", "gold", "platinum", "fresh", "aged", "new", "goat", "ethos"}
+
+PHONE_RE = re.compile(r"(\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 def _now() -> datetime:
     return datetime.utcnow()
@@ -94,6 +106,34 @@ def normalize_phone(val: Any) -> Optional[str]:
         return "+" + digits
     return None
 
+def normalize_state(val: Any) -> Optional[str]:
+    s = (clean_text(val) or "").strip()
+    if not s:
+        return None
+    s2 = s.upper()
+    if _US_STATE_RE.match(s2):
+        return s2
+    return None
+
+def safe_full_name(val: Any) -> str:
+    s = clean_text(val) or ""
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return "Unknown"
+    low = s.lower()
+    # If the "name" looks like a tier/source/keyword, treat as unknown
+    if low in BAD_NAME_WORDS:
+        return "Unknown"
+    if any(x in low for x in ["bronze", "silver", "gold", "platinum", "fresh", "aged"]):
+        # If it's basically just those words, not a real name
+        parts = [p for p in re.split(r"[\s,]+", low) if p]
+        if all(p in TIER_WORDS or p in BAD_NAME_WORDS for p in parts):
+            return "Unknown"
+    # If contains too many digits, it's not a name
+    if sum(c.isdigit() for c in s) >= 2:
+        return "Unknown"
+    return s[:200]
+
 def safe_first_name(full_name: Optional[str]) -> str:
     if not full_name:
         return ""
@@ -104,42 +144,37 @@ def safe_first_name(full_name: Optional[str]) -> str:
         return ""
     return first.capitalize()
 
-def normalize_state(val: Any) -> Optional[str]:
-    s = (clean_text(val) or "").strip()
-    if not s:
-        return None
-    s2 = s.upper()
-    if _US_STATE_RE.match(s2):
-        return s2
-    return None
-
-def dedupe_exists(db: Session, phone: Optional[str], email: Optional[str]) -> bool:
-    if phone and db.query(Lead).filter(Lead.phone == phone).first():
-        return True
-    if email and db.query(Lead).filter(Lead.email == email).first():
-        return True
-    return False
-
 def _log(db: Session, lead_id: Optional[int], run_id: Optional[int], event: str, detail: str):
     db.add(AuditLog(
         lead_id=lead_id,
         run_id=run_id,
-        event=event,
+        event=(event or "")[:120],
         detail=(detail or "")[:5000],
         created_at=_now(),
     ))
 
-def mem_set(db: Session, lead_id: int, key: str, value: str):
-    row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
-    if row:
-        row.value = value
-        row.updated_at = _now()
-    else:
-        db.add(LeadMemory(lead_id=lead_id, key=key, value=value, updated_at=_now()))
-
 def mem_get(db: Session, lead_id: int, key: str) -> Optional[str]:
     row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
     return row.value if row else None
+
+def mem_set(db: Session, lead_id: int, key: str, value: str):
+    v = (value or "").strip()
+    if not v:
+        return
+    row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
+    if row:
+        row.value = v
+        row.updated_at = _now()
+    else:
+        db.add(LeadMemory(lead_id=lead_id, key=key, value=v, updated_at=_now()))
+
+def mem_bulk_set(db: Session, lead_id: int, d: Dict[str, Any]):
+    for k, v in (d or {}).items():
+        if v is None:
+            continue
+        vv = clean_text(v)
+        if vv:
+            mem_set(db, lead_id, k, vv)
 
 def require_admin(req: Request, token_from_form: str = "") -> bool:
     token = (token_from_form or req.headers.get("x-admin-token", "") or req.query_params.get("token", "") or "").strip()
@@ -148,80 +183,53 @@ def require_admin(req: Request, token_from_form: str = "") -> bool:
         return False
     return token == want
 
-
-# =========================
-# Timezone inference (simple + safe)
-# =========================
-def infer_timezone_from_phone(phone_e164: Optional[str]) -> Optional[str]:
-    """
-    Conservative:
-    - If unknown, default to America/Denver (your timezone) instead of blocking outreach.
-    - You can upgrade later with a real libphonenumber mapping.
-    """
-    if not phone_e164:
-        return "America/Denver"
-    # If it is +1 US/CA, assume your timezone for now.
-    # Upgrade later: parse area code mapping.
-    return (os.getenv("DEFAULT_TIMEZONE") or "America/Denver").strip()
-
-def allowed_to_contact(lead: Lead) -> bool:
-    tz_name = (lead.timezone or "").strip()
-    if not tz_name:
-        tz_name = (os.getenv("DEFAULT_TIMEZONE") or "America/Denver").strip()
-    try:
-        tz = ZoneInfo(tz_name)
-    except Exception:
-        tz = ZoneInfo("America/Denver")
-    local_hour = datetime.now(tz).hour
-    return 8 <= local_hour < 21
-
-
-# =========================
-# Owner escalation + forwarding rules
-# =========================
 def owner_mobile() -> str:
-    return (os.getenv("OWNER_MOBILE") or os.getenv("TWILIO_OWNER_NUMBER") or os.getenv("TWILIO_TO_NUMBER") or "").strip()
+    return (os.getenv("OWNER_MOBILE") or os.getenv("ALERT_PHONE_NUMBER") or "").strip()
 
 def notify_owner(db: Session, lead: Optional[Lead], msg: str, tag: str = "OWNER_NOTIFY"):
+    who = ""
+    if lead:
+        who = f"#{lead.id} {lead.full_name or 'Unknown'} {lead.phone or ''}".strip()
+    payload = f"{tag}\n{who}\n\n{(msg or '').strip()}".strip()
     try:
-        who = ""
-        if lead:
-            who = f"#{lead.id} {lead.full_name or 'Unknown'} {lead.phone or ''}".strip()
-        payload = f"{tag}\n{who}\n\n{(msg or '').strip()}".strip()
         _log(db, lead.id if lead else None, None, tag, payload[:5000])
         db.commit()
     except Exception:
         pass
-
     try:
         if owner_mobile():
             send_alert_sms(payload)
     except Exception as e:
         try:
-            _log(db, lead.id if lead else None, None, "OWNER_NOTIFY_FAILED", str(e)[:2000])
+            _log(db, lead.id if lead else None, None, "OWNER_NOTIFY_FAILED", str(e)[:500])
             db.commit()
         except Exception:
             pass
 
-def cancel_pending_actions(db: Session, lead_id: int, reason: str):
-    actions = db.query(Action).filter(Action.lead_id == lead_id, Action.status == "PENDING").all()
-    for a in actions:
-        a.status = "SKIPPED"
-        a.error = f"Canceled: {reason}"
-        a.finished_at = _now()
-    _log(db, lead_id, None, "ACTIONS_CANCELED", reason)
+def dedupe_exists(db: Session, phone: Optional[str], email: Optional[str]) -> bool:
+    if phone and db.query(Lead).filter(Lead.phone == phone).first():
+        return True
+    if email and db.query(Lead).filter(Lead.email == email).first():
+        return True
+    return False
 
-def classify_inbound_text(body: str) -> str:
-    t = (body or "").strip().lower()
-    if any(x in t for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
-        return "STOP"
-    if any(x in t for x in ["appointment", "appt", "schedule", "book", "tomorrow", "today", "am", "pm", "morning", "afternoon", "evening"]):
-        return "APPT"
-    if any(x in t for x in ["call me", "ready", "yes", "yep", "yeah", "now", "interested"]):
-        return "HOT"
-    if any(x in t for x in ["how much", "price", "cost", "quote", "coverage", "premium", "whole life", "term", "monthly"]):
-        return "QUESTION"
-    return "NEUTRAL"
+
+# =========================
+# Timezone inference (SAFE default + upgrade later)
+# =========================
+def infer_timezone_from_phone(phone_e164: Optional[str]) -> str:
+    # Safe default for now; upgrade later with libphonenumber/area-code map.
+    return (os.getenv("APP_TIMEZONE") or os.getenv("DEFAULT_TIMEZONE") or "America/Denver").strip()
+
+def allowed_to_contact_now(tz_name: str) -> bool:
+    tz_name = (tz_name or "").strip() or infer_timezone_from_phone(None)
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo(infer_timezone_from_phone(None))
+    hr = datetime.now(tz).hour
+    # Compliance window: 8am to 8:59pm
+    return 8 <= hr < 21
 
 
 # =========================
@@ -240,7 +248,7 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
                     chunks.append(txt)
             except Exception:
                 continue
-        return "\n".join(chunks)
+        return "\n\n".join(chunks)
     except Exception:
         return ""
 
@@ -255,441 +263,264 @@ def extract_text_from_image_bytes(data: bytes) -> str:
 
 
 # =========================
-# Lead normalization (CSV + Text blocks)
+# Normalization: CSV rows + raw text blocks (PDF/OCR)
 # =========================
-def normalize_to_leads(data):
+def _looks_like_header(row: List[str]) -> bool:
+    low = ",".join([(c or "").strip().lower() for c in row])
+    return ("first" in low and "last" in low and "phone" in low) or ("email" in low and "phone" in low)
+
+def normalize_csv_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
     """
-    # Vendor-specific positional CSV (your exact format)
-elif isinstance(row, (list, tuple)) and len(row) >= 8:
-    first = row[0].strip()
-    last = row[1].strip()
-    cov_type = row[2].strip()        # IUL
-    tier = row[3].strip()            # GOAT
-    phone = row[4].strip()
-    dob = row[6].strip()
-    email = row[7].strip()
-    st = row[8].strip() if len(row) > 8 else None
-
-    leads.append({
-        "full_name": f"{first} {last}".strip(),
-        "phone": phone,
-        "email": email,
-        "state": st,
-        "birthdate": dob,
-        "coverage_type": cov_type,
-        "tier": tier,
-        "lead_source": "csv_vendor",
-    })
-    continue
-Accepts:
-      - list[dict]  (CSV with headers)
-      - list[list]  (CSV without headers)
-      - raw text    (PDF / OCR)
-    Returns: list of normalized lead dicts
+    Your vendor positional CSV format (most common):
+      0 First
+      1 Last
+      2 Product (IUL/TERM/etc)
+      3 Tier/Vendor label (GOAT/ETHOS/FRESH/AGED/etc)
+      4 Phone
+      6 DOB
+      7 Email
+      8 State
     """
-    leads = []
+    out: List[Dict[str, Any]] = []
+    if not rows:
+        return out
+    # If first row is header, skip
+    start = 1 if isinstance(rows[0], list) and _looks_like_header(rows[0]) else 0
 
-    # -------------------------
-    # CSV (list-based)
-    # -------------------------
-    if isinstance(data, list):
-        for row in data:
-
-            # HEADER-BASED CSV
-            if isinstance(row, dict):
-                clean = {}
-                for k, v in row.items():
-                    if not k:
-                        continue
-                    kk = str(k).strip().lower()
-                    vv = v.strip() if isinstance(v, str) else v
-                    clean[kk] = vv
-
-                first = clean.get("first name") or clean.get("firstname") or clean.get("first")
-                last = clean.get("last name") or clean.get("lastname") or clean.get("last")
-                full_name = clean.get("full name") or clean.get("name")
-                if not full_name:
-                    full_name = f"{first or ''} {last or ''}".strip() or None
-
-                phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell")
-                email = clean.get("email")
-                state = clean.get("state") or clean.get("st")
-                dob = clean.get("dob") or clean.get("date of birth") or clean.get("birthdate")
-                coverage_type = clean.get("policy type") or clean.get("coverage type") or clean.get("type")
-                source = clean.get("vendor") or clean.get("source")
-
-            # POSITIONAL CSV (YOUR FILES)
-            elif isinstance(row, (list, tuple)) and len(row) >= 5:
-                first = (row[0] or "").strip()
-                last = (row[1] or "").strip()
-                coverage_type = (row[2] or "").strip()     # IUL
-                source = (row[3] or "").strip()            # GOAT
-                phone = (row[4] or "").strip()
-                dob = (row[6] or "").strip() if len(row) > 6 else None
-                email = (row[7] or "").strip() if len(row) > 7 else None
-                state = (row[8] or "").strip() if len(row) > 8 else None
-                full_name = f"{first} {last}".strip() or None
-
-            else:
-                continue
-
-            leads.append({
-                "full_name": full_name,
-                "phone": phone,
-                "email": email,
-                "state": state,
-                "birthdate": dob,
-                "coverage_type": coverage_type,
-                "lead_source": source,
-            })
-
-        return leads
-
-    # -------------------------
-    # TEXT (PDF / OCR)
-    # -------------------------
-    raw = str(data or "")
-    buf = {}
-    phone_re = re.compile(r"(\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})")
-    email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-    def flush():
-        nonlocal buf
-        if buf.get("phone") or buf.get("email"):
-            leads.append(buf)
-        buf = {}
-
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            flush()
+    for r in rows[start:]:
+        if not isinstance(r, list):
             continue
+        # Pad
+        while len(r) < 9:
+            r.append("")
+        first = (r[0] or "").strip()
+        last = (r[1] or "").strip()
+        product = (r[2] or "").strip()
+        tier = (r[3] or "").strip()
+        phone = (r[4] or "").strip()
+        dob = (r[6] or "").strip() if len(r) > 6 else ""
+        email = (r[7] or "").strip() if len(r) > 7 else ""
+        st = (r[8] or "").strip() if len(r) > 8 else ""
 
-        low = line.lower()
+        full_name = safe_full_name(f"{first} {last}".strip())
 
-        if ":" in line:
-            k, v = line.split(":", 1)
-            key = k.strip().lower()
-            val = v.strip()
+        out.append({
+            "full_name": full_name,
+            "phone": phone,
+            "email": email,
+            "us_state": st,
+            "birthdate": dob,
+            "product_interest": product,
+            "tier": tier,
+            "lead_source": "csv_vendor",
+        })
+    return out
 
-            if key in ["name", "full name"]:
-                buf["full_name"] = val
-            elif key in ["phone", "mobile", "cell"]:
-                buf["phone"] = val
-            elif key == "email":
-                buf["email"] = val
-            elif key in ["state", "st"]:
-                buf["state"] = val
-            elif "birth" in key or "dob" in key:
-                buf["birthdate"] = val
-            elif "coverage" in key or "policy" in key:
-                buf["coverage_type"] = val
-            elif key in ["vendor", "source"]:
-                buf["lead_source"] = val
-            continue
+def _split_text_into_lead_blocks(raw: str) -> List[str]:
+    """
+    Prevents 'one lead becomes 100 leads' by splitting on strong separators only.
+    If no separators are found, returns one block (and we then extract multiple phones/emails as extras).
+    """
+    t = (raw or "").strip()
+    if not t:
+        return []
 
-        if m := phone_re.search(line):
-            buf["phone"] = m.group(1)
+    # Strong boundaries commonly present in lead PDFs
+    boundary = re.compile(
+        r"(?im)^\s*(inquiry\s*id|inquiry\s*Id|lead\s*id|lead\s*Id)\s*[:#]",
+    )
 
-        if m := email_re.search(line):
-            buf["email"] = m.group(0)
-
-        if "full_name" not in buf and len(line.split()) >= 2 and not any(c.isdigit() for c in line):
-            if len(line) <= 40:
-                buf["full_name"] = line
-
-    flush()
-    return leads
-
-    # Text parse (PDF / OCR / Doc)
-    raw = (data or "")
-    if not isinstance(raw, str):
-        raw = str(raw)
-
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    buf: Dict[str, Any] = {}
-
-    phone_re = re.compile(r"(\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})")
-    email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-
-    def flush():
-        nonlocal buf
-        if buf.get("phone") or buf.get("email"):
-            leads.append(buf)
-        buf = {}
+    lines = t.splitlines()
+    blocks: List[List[str]] = []
+    cur: List[str] = []
 
     for line in lines:
-        low = line.lower()
+        if boundary.search(line) and cur:
+            blocks.append(cur)
+            cur = [line]
+        else:
+            cur.append(line)
 
-        # Split by common "Label: value" formats
-        if ":" in line:
-            left, right = line.split(":", 1)
-            key = left.strip().lower()
-            val = right.strip()
+    if cur:
+        blocks.append(cur)
 
-            if key in ["name", "full name"]:
-                buf["full_name"] = val
-            elif key in ["phone", "phone number", "mobile", "cell"]:
-                buf["phone"] = val
-            elif key in ["email"]:
-                buf["email"] = val
-            elif key in ["state", "st"]:
-                buf["state"] = val
-            elif key in ["dob", "date of birth", "birthdate"]:
-                buf["birthdate"] = val
-            elif "coverage" in key:
-                buf["coverage_requested"] = val
-            elif "type" in key:
-                buf["coverage_type"] = val
-            elif key in ["inquiry id", "lead id", "reference", "ref"]:
-                buf["lead_reference"] = val
-                flush()
-            else:
-                # ignore unknown keys
-                pass
+    # If we only got 1 block, try alternative: long dashed separators
+    if len(blocks) <= 1:
+        alt = re.split(r"(?m)^\s*-{5,}\s*$|^\s*={5,}\s*$", t)
+        alt = [a.strip() for a in alt if a.strip()]
+        if len(alt) > 1:
+            return alt
+
+    return ["\n".join(b).strip() for b in blocks if b and "\n".join(b).strip()]
+
+def _extract_contacts_from_block(block: str) -> Tuple[Optional[str], List[str], List[str]]:
+    phones_raw = PHONE_RE.findall(block or "")
+    emails = EMAIL_RE.findall(block or "")
+
+    norm_phones: List[str] = []
+    for pr in phones_raw:
+        p = normalize_phone(pr)
+        if p and p not in norm_phones:
+            norm_phones.append(p)
+
+    norm_emails: List[str] = []
+    for e in emails:
+        ee = clean_text(e)
+        if ee and ee not in norm_emails:
+            norm_emails.append(ee)
+
+    primary = norm_phones[0] if norm_phones else None
+    return primary, norm_phones, norm_emails
+
+def _guess_name_from_block(block: str) -> str:
+    # Look for "First Name:" / "Last Name:" / "Name:"
+    first = None
+    last = None
+    m = re.search(r"(?im)^\s*First\s*Name\s*:\s*(.+)\s*$", block)
+    if m:
+        first = clean_text(m.group(1))
+    m = re.search(r"(?im)^\s*Last\s*Name\s*:\s*(.+)\s*$", block)
+    if m:
+        last = clean_text(m.group(1))
+    if first or last:
+        return safe_full_name(f"{first or ''} {last or ''}".strip())
+
+    m = re.search(r"(?im)^\s*Name\s*:\s*(.+)\s*$", block)
+    if m:
+        return safe_full_name(m.group(1))
+
+    # Fallback: first non-empty line that looks like a person name
+    for line in (block or "").splitlines():
+        s = clean_text(line)
+        if not s:
+            continue
+        if len(s) > 45:
+            continue
+        low = s.lower()
+        # Skip obvious non-name lines
+        if any(w in low for w in ["inquiry", "coverage", "amount", "address", "city", "state", "zip", "phone", "email"]):
+            continue
+        if sum(c.isdigit() for c in s) >= 1:
+            continue
+        parts = s.split()
+        if len(parts) >= 2 and all(len(p) >= 2 for p in parts[:2]):
+            nm = safe_full_name(s)
+            if nm != "Unknown":
+                return nm
+    return "Unknown"
+
+def normalize_text_to_leads(raw: str) -> List[Dict[str, Any]]:
+    blocks = _split_text_into_lead_blocks(raw)
+    out: List[Dict[str, Any]] = []
+
+    for b in blocks:
+        primary_phone, phones, emails = _extract_contacts_from_block(b)
+        # Phone is mandatory (your rule)
+        if not primary_phone:
             continue
 
-        # Otherwise pattern match
-        m1 = phone_re.search(line)
-        if m1:
-            buf["phone"] = m1.group(1)
+        name = _guess_name_from_block(b)
 
-        m2 = email_re.search(line)
-        if m2:
-            buf["email"] = m2.group(0)
+        # Extract common fields if present
+        tier = None
+        m = re.search(r"(?im)\b(BRONZE|SILVER|GOLD|PLATINUM|FRESH|AGED|GOAT|ETHOS)\b", b)
+        if m:
+            tier = m.group(1).upper()
 
-        # Detect likely name line (first non-empty, no digits)
-        if "full_name" not in buf and len(line.split()) >= 2 and not any(c.isdigit() for c in line):
-            # conservative: only if it's shortish
-            if len(line) <= 40:
-                buf["full_name"] = line
+        us_state = None
+        m = re.search(r"(?im)^\s*State\s*:\s*([A-Za-z]{2})\s*$", b)
+        if m:
+            us_state = normalize_state(m.group(1))
 
-        # If we have enough to consider it a lead, and we hit a blank-ish separator next, flush
-        if (buf.get("phone") or buf.get("email")) and ("---" in line or "====" in line):
-            flush()
+        dob = None
+        m = re.search(r"(?im)^\s*(DOB|Date of Birth|Birthdate)\s*:\s*(.+)\s*$", b)
+        if m:
+            dob = clean_text(m.group(2))
 
-    flush()
-    return leads
+        cov = None
+        m = re.search(r"(?im)^\s*(Requested Coverage|Coverage Amount|Face Value|Current Coverage Amount)\s*:\s*([$]?\s*[\d,]+)\s*$", b)
+        if m:
+            cov = clean_text(m.group(2))
+
+        inquiry_id = None
+        m = re.search(r"(?im)^\s*(Inquiry\s*Id|Inquiry\s*ID|Lead\s*Id|Lead\s*ID)\s*[:#]\s*(.+)\s*$", b)
+        if m:
+            inquiry_id = clean_text(m.group(2))
+
+        out.append({
+            "full_name": name,
+            "phone": primary_phone,
+            "email": (emails[0] if emails else None),
+            "tier": tier,
+            "us_state": us_state,
+            "birthdate": dob,
+            "coverage_requested": cov,
+            "lead_reference": inquiry_id,
+            "phones_all": phones,
+            "emails_all": emails,
+            "raw_text": b[:12000],
+            "lead_source": "pdf_or_ocr",
+        })
+
+    return out
 
 
 # =========================
-# DB Insert helper (THIS is what your imports use)
+# Import helper: insert/merge safely (NO extra Lead columns)
 # =========================
-def _import_row(db: Session, row: Dict[str, Any]) -> bool:
-    phone = normalize_phone(row.get("phone"))
-    full_name = clean_text(item.get("full_name") or "")
-    email = clean_text(row.get("email"))
-    name = clean_text(row.get("full_name")) or "Unknown"
-
+def import_one_lead(db: Session, item: Dict[str, Any], source_tag: str) -> Dict[str, Any]:
+    """
+    Returns: {"ok": bool, "created": bool, "merged": bool, "skipped": bool, "reason": "...", "lead_id": int|None}
+    Enforces: phone mandatory
+    """
+    phone = normalize_phone(item.get("phone") or "")
     if not phone:
-        return False
+        return {"ok": True, "skipped": True, "reason": "missing_phone", "lead_id": None}
 
-    if dedupe_exists(db, phone, email):
-        return False
+    email = clean_text(item.get("email") or "")
+    full_name = safe_full_name(item.get("full_name"))
+
+    existing = db.query(Lead).filter(Lead.phone == phone).first()
+    if existing:
+        # Merge extras to memory
+        extras = dict(item)
+        extras.pop("phone", None)
+        extras.pop("email", None)
+        extras.pop("full_name", None)
+
+        mem_set(db, existing.id, "source_tag", source_tag)
+        mem_set(db, existing.id, "source_type", source_tag)
+        mem_bulk_set(db, existing.id, extras)
+        existing.updated_at = _now()
+        return {"ok": True, "created": False, "merged": True, "skipped": False, "lead_id": existing.id}
 
     tz = infer_timezone_from_phone(phone)
-    st = normalize_state(row.get("state"))
-    birth = clean_text(row.get("birthdate"))
-    cov = clean_text(row.get("coverage_requested"))
-    cov_type = clean_text(row.get("coverage_type"))
-    src = clean_text(row.get("lead_source"))
-    ref = clean_text(row.get("lead_reference"))
 
-lead = Lead(
-    full_name=full_name or "Unknown",
-    phone=phone,
-    email=email,
-    state="NEW",
-    timezone=tz,
-    created_at=_now(),
-    updated_at=_now(),
-)
-db.add(lead)
-db.flush()   # VERY IMPORTANT
-# Store all extra intelligence in LeadMemory
-extras = {
-    "us_state": st,
-    "birthdate": birth,
-    "coverage_requested": cov,
-    "coverage_type": cov_type,
-    "lead_source": src,
-    "lead_reference": ref,
-}
-
-for k, v in extras.items():
-    if v:
-        _mem_upsert(db, lead.id, k, str(v))
-
+    lead = Lead(
+        full_name=full_name or "Unknown",
+        phone=phone,                  # MANDATORY
+        email=email or None,
+        state="NEW",                  # workflow state
+        timezone=tz,
+        created_at=_now(),
+        updated_at=_now(),
+    )
     db.add(lead)
-import re
-import json
-from typing import Dict, Any, Optional
+    db.flush()
 
-# ---------- PDF Lead Parsing Helpers ----------
+    # Everything else into memory
+    extras = dict(item)
+    extras.pop("phone", None)
+    extras.pop("email", None)
+    extras.pop("full_name", None)
 
-_TIER_RE = re.compile(r"\b(BRONZE|SILVER|GOLD|PLATINUM)\b", re.IGNORECASE)
+    mem_set(db, lead.id, "source_tag", source_tag)
+    mem_set(db, lead.id, "source_type", source_tag)
+    mem_bulk_set(db, lead.id, extras)
 
-def _first_match(pattern: str, text: str, flags=0) -> Optional[str]:
-    m = re.search(pattern, text, flags)
-    if not m:
-        return None
-    val = (m.group(1) or "").strip()
-    return val if val else None
-
-def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
-    rows = (
-        db.query(LeadMemory)
-        .filter(LeadMemory.lead_id == lead_id)
-        .order_by(LeadMemory.key.asc())
-        .all()
-    )
-    return {r.key: r.value for r in rows}
-
-def _extract_label(text: str, label: str) -> Optional[str]:
-    """
-    Extracts 'Label: value' where value is the rest of the line.
-    Works even if there are extra spaces.
-    """
-    # Example: "First Name: Bobby"
-    pat = rf"{re.escape(label)}\s*:\s*(.+)"
-    return _first_match(pat, text, flags=re.IGNORECASE)
-
-def _extract_amount(text: str, label: str) -> Optional[str]:
-    """
-    Extract common money formats after a label, e.g. "$25,000" or "25000".
-    """
-    pat = rf"{re.escape(label)}\s*:\s*([$]?\s*[\d,]+)"
-    v = _first_match(pat, text, flags=re.IGNORECASE)
-    return v.replace(" ", "") if v else None
-
-def _extract_yesno(text: str, label: str) -> Optional[str]:
-    pat = rf"{re.escape(label)}\s*:\s*(Yes|No|Y|N|True|False)"
-    v = _first_match(pat, text, flags=re.IGNORECASE)
-    if not v:
-        return None
-    v2 = v.strip().lower()
-    if v2 in ("y", "yes", "true"):
-        return "Yes"
-    if v2 in ("n", "no", "false"):
-        return "No"
-    return v
-
-def _infer_tier_from_page(text: str) -> Optional[str]:
-    """
-    Looks for e.g. "BRONZE LIFE INQUIRY" anywhere on the page.
-    """
-    m = _TIER_RE.search(text or "")
-    return m.group(1).upper() if m else None
-
-def _parse_one_lead_from_page(page_text: str) -> Dict[str, Any]:
-    """
-    Deterministic extraction (no AI guessing).
-    Missing fields are allowed.
-    """
-    t = (page_text or "").strip()
-
-    # Tier/header classification
-    tier = _infer_tier_from_page(t)
-
-    inquiry_id = _extract_label(t, "Inquiry Id") or _extract_label(t, "Inquiry ID")
-
-    first = _extract_label(t, "First Name")
-    last = _extract_label(t, "Last Name")
-
-    # Some formats use "Name:" instead
-    if not first and not last:
-        name_line = _extract_label(t, "Name")
-        if name_line and " " in name_line:
-            parts = name_line.split()
-            first = parts[0]
-            last = " ".join(parts[1:])
-
-    # Contacts
-    phone_raw = _extract_label(t, "Phone") or _extract_label(t, "Mobile") or _extract_label(t, "Phone Number")
-    email = _extract_label(t, "Email") or _extract_label(t, "E-mail")
-
-    # Demographics
-    age = _extract_label(t, "Age")
-    dob = _extract_label(t, "Date of Birth") or _extract_label(t, "DOB")
-
-    # Address fields vary a lot; capture both line-style and labeled fields
-    addr1 = _extract_label(t, "Address") or _extract_label(t, "Street")
-    city = _extract_label(t, "City")
-    state = _extract_label(t, "State")
-    zipc = _extract_label(t, "Zip") or _extract_label(t, "ZIP")
-    county = _extract_label(t, "County")
-
-    # Underwriting / needs
-    smoker = _extract_yesno(t, "Is Smoker") or _extract_yesno(t, "Smoker")
-    height = _extract_label(t, "Height")
-    weight = _extract_label(t, "Weight")
-    beneficiary = _extract_label(t, "Beneficiary Name") or _extract_label(t, "Beneficiary")
-    military = _extract_yesno(t, "Is Military") or _extract_yesno(t, "Military")
-
-    # Coverage fields
-    requested = (
-        _extract_amount(t, "Current Coverage Amount")
-        or _extract_amount(t, "Coverage Amount")
-        or _extract_amount(t, "Requested Coverage")
-        or _extract_amount(t, "Face Value")
-    )
-
-    return {
-        "tier": tier,
-        "inquiry_id": inquiry_id,
-        "first_name": first,
-        "last_name": last,
-        "phone": phone_raw,
-        "email": email,
-        "age": age,
-        "dob": dob,
-        "address": addr1,
-        "city": city,
-        "us_state": state,
-        "zip": zipc,
-        "county": county,
-        "smoker": smoker,
-        "height": height,
-        "weight": weight,
-        "beneficiary": beneficiary,
-        "military": military,
-        "coverage_requested": requested,
-        "raw_text": t,
-    }
-
-def _mem_upsert(db, lead_id: int, key: str, value: str):
-    """
-    Upserts LeadMemory entries. Uses your UniqueConstraint(lead_id, key).
-    """
-    v = (value or "").strip()
-    if not v:
-        return
-
-    existing = (
-        db.query(LeadMemory)
-        .filter(LeadMemory.lead_id == lead_id, LeadMemory.key == key)
-        .first()
-    )
-    if existing:
-        existing.value = v
-        existing.updated_at = _now()
-    else:
-        db.add(LeadMemory(
-            lead_id=lead_id,
-            key=key,
-            value=v,
-            updated_at=_now(),
-        ))
-
-def _safe_full_name(first: Optional[str], last: Optional[str]) -> str:
-    f = clean_text(first or "")
-    l = clean_text(last or "")
-    name = (f"{f} {l}").strip()
-    return name if name else "Unknown"
+    return {"ok": True, "created": True, "merged": False, "skipped": False, "lead_id": lead.id}
 
 
-# ---------- PDF Import Endpoint (Immediate Import) ----------
-    
 # =========================
 # Health / Root / Service worker
 # =========================
@@ -709,132 +540,88 @@ def sw():
 
 
 # =========================
-# AI chat (server-side) with offline fallback
+# Worker execution (PENDING actions)
 # =========================
-async def llm_reply(user_text: str, context: str = "") -> str:
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        return "AI is OFF (OPENAI_API_KEY missing). Use: counts | show pending | show newest | run planner | lead 123"
+def execute_pending_actions(db: Session, limit: int = 5) -> Dict[str, Any]:
+    nowv = _now()
+    executed = 0
+    failed = 0
+    skipped = 0
 
-    model = (os.getenv("OPENAI_MODEL") or "gpt-5").strip()
-
-    system = (
-        "You are AgencyVault AI Employee for a life insurance agency.\n"
-        "Be direct and practical.\n"
-        "Never invent database values.\n"
-        "If lead replied with a question, recommend that Nick calls personally.\n"
+    actions = (
+        db.query(Action)
+        .filter(Action.status == "PENDING")
+        .order_by(Action.created_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+        .all()
     )
-    if context:
-        system += "\nLive context:\n" + context
 
-    payload = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_text},
-        ],
-    }
+    for a in actions:
+        try:
+            payload = json.loads(a.payload_json or "{}")
 
-    async with httpx.AsyncClient(timeout=35) as client:
-        r = await client.post(
-            "https://api.openai.com/v1/responses",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=payload,
-        )
-        if r.status_code >= 400:
-            return f"AI error {r.status_code}: {(r.text or '')[:400]}"
+            lead = db.query(Lead).filter_by(id=a.lead_id).first()
+            if not lead:
+                a.status = "FAILED"
+                a.error = "Lead missing"
+                failed += 1
+                continue
 
-        data = r.json()
+            # Due time (for calls)
+            due_at = payload.get("due_at")
+            if due_at:
+                try:
+                    if nowv < datetime.fromisoformat(due_at):
+                        skipped += 1
+                        continue
+                except Exception:
+                    pass
 
+            # Quiet hours for outreach (but NOT for owner alerts)
+            tz_name = lead.timezone or infer_timezone_from_phone(lead.phone)
+            if not allowed_to_contact_now(tz_name):
+                skipped += 1
+                continue
+
+            if a.type == "TEXT":
+                send_lead_sms(payload["to"], payload["message"])
+            elif a.type == "CALL":
+                if not _make_call:
+                    raise RuntimeError("Call function not available in twilio_client.py")
+                _make_call(payload["to"], payload.get("lead_id"))
+            else:
+                raise RuntimeError(f"Unknown action type: {a.type}")
+
+            a.status = "DONE"
+            a.finished_at = _now()
+            executed += 1
+
+        except Exception as e:
+            a.status = "FAILED"
+            a.error = str(e)[:500]
+            failed += 1
+
+    db.commit()
+    return {"ok": True, "executed": executed, "failed": failed, "skipped": skipped}
+
+# Allow GET so you can click it in browser (you hit 405 earlier)
+@app.get("/worker/execute")
+def worker_execute(limit: int = 5):
+    db = SessionLocal()
     try:
-        out = data.get("output", [])
-        chunks = []
-        for item in out:
-            for c in item.get("content", []):
-                if c.get("type") == "output_text":
-                    chunks.append(c.get("text", ""))
-        text_out = "\n".join([x for x in chunks if x]).strip()
-        return text_out or "AI returned no text."
-    except Exception:
-        return "AI response parsing failed."
-
-def offline_assistant(db: Session, msg: str) -> str:
-    low = (msg or "").strip().lower()
-    if not low:
-        return "Type: counts | show pending | show newest | run planner | lead 123"
-
-    if "counts" in low:
-        total = db.query(Lead).count()
-        new = db.query(Lead).filter(Lead.state == "NEW").count()
-        working = db.query(Lead).filter(Lead.state == "WORKING").count()
-        contacted = db.query(Lead).filter(Lead.state == "CONTACTED").count()
-        dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
-        pend = db.query(Action).filter(Action.status == "PENDING").count()
-        return (
-            "Counts:\n"
-            f"- total={total}\n"
-            f"- NEW={new}\n"
-            f"- WORKING={working}\n"
-            f"- CONTACTED={contacted}\n"
-            f"- DNC={dnc}\n"
-            f"- pending_actions={pend}"
-        )
-
-    if "show" in low and "pending" in low:
-        actions = (
-            db.query(Action)
-            .filter(Action.status == "PENDING")
-            .order_by(Action.created_at.asc())
-            .limit(25)
-            .all()
-        )
-        if not actions:
-            return "No pending actions."
-        return "Pending actions:\n" + "\n".join([f"- #{a.id} {a.type} lead={a.lead_id} created={a.created_at}" for a in actions])
-
-    if "show" in low and ("newest" in low or "recent" in low):
-        leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(15).all()
-        if not leads:
-            return "No leads found."
-        return "Newest leads:\n" + "\n".join([f"- #{l.id} {l.full_name} {l.phone} [{l.state}]" for l in leads])
-
-    if low.startswith("lead "):
-        nums = re.findall(r"\d+", low)
-        if not nums:
-            return "Usage: lead 123"
-        lead_id = int(nums[0])
-        lead = db.query(Lead).filter_by(id=lead_id).first()
-        if not lead:
-            return f"No lead with id {lead_id}"
-        return (
-            f"Lead #{lead.id}\n"
-            f"Name: {lead.full_name}\n"
-            f"Phone: {lead.phone}\n"
-            f"Email: {lead.email or '-'}\n"
-            f"Workflow: {lead.state}\n"
-            f"US State: {getattr(lead, 'us_state', None) or '-'}\n"
-            f"Timezone: {lead.timezone or '-'}\n"
-            f"Coverage: {getattr(lead, 'coverage_requested', None) or '-'}\n"
-        )
-
-    if "run" in low and "planner" in low:
-        out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
-        return json.dumps(out, indent=2)
-
-    return "Try: counts | show pending | show newest | run planner | lead 123"
+        out = execute_pending_actions(db, limit=limit)
+        _log(db, None, None, "WORKER_EXECUTE", json.dumps(out)[:5000])
+        db.commit()
+        return out
+    finally:
+        db.close()
 
 
 # =========================
 # Planner (creates PENDING actions)
-# IMPORTANT: payload_json uses keys your worker can execute:
-#   TEXT -> {"to": "...", "message": "..."}
-#   CALL -> {"to": "...", "lead_id": 123}
 # =========================
 def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
-    paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
-    if paused:
-        return {"ok": False, "paused": True, "message": "AI work is PAUSED by operator."}
-
     run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="Planner run")
     db.add(run)
     db.flush()
@@ -845,7 +632,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     leads = (
         db.query(Lead)
-        .filter(Lead.state == "NEW", Lead.phone.isnot(None))
+        .filter(Lead.state == "NEW")
         .order_by(Lead.created_at.asc())
         .limit(batch_size)
         .all()
@@ -854,7 +641,9 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
     for lead in leads:
         considered += 1
 
-        # Ensure timezone exists
+        if not (lead.phone or "").strip():
+            continue
+
         if not (lead.timezone or "").strip():
             lead.timezone = infer_timezone_from_phone(lead.phone)
 
@@ -871,26 +660,18 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
             type="TEXT",
             status="PENDING",
             tool="twilio",
-            payload_json=json.dumps({
-                "to": lead.phone,
-                "message": msg1
-            }),
+            payload_json=json.dumps({"to": lead.phone, "message": msg1}),
             created_at=nowv,
         ))
         planned += 1
 
-        # Optional call follow-up (15 min later)
         call_due = (nowv + timedelta(minutes=15)).isoformat()
         db.add(Action(
             lead_id=lead.id,
             type="CALL",
             status="PENDING",
             tool="twilio",
-            payload_json=json.dumps({
-                "to": lead.phone,
-                "lead_id": lead.id,
-                "due_at": call_due
-            }),
+            payload_json=json.dumps({"to": lead.phone, "lead_id": lead.id, "due_at": call_due}),
             created_at=nowv,
         ))
         planned += 1
@@ -904,75 +685,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     _log(db, None, run.id, "AI_PLANNED", f"planned={planned} considered={considered}")
     db.commit()
-
     return {"ok": True, "run_id": run.id, "planned_actions": planned, "considered": considered}
-
-@app.get("/leads/{lead_id}", response_class=HTMLResponse)
-def lead_detail(lead_id: int):
-    db = SessionLocal()
-    try:
-        lead = db.query(Lead).filter_by(id=lead_id).first()
-        if not lead:
-            return HTMLResponse("Lead not found", status_code=404)
-
-        mem = get_lead_memory_dict(db, lead.id)
-
-        def row(label, key):
-            val = mem.get(key)
-            if not val:
-                return ""
-            return f"""
-            <tr>
-              <td style="padding:6px 10px;color:rgba(230,237,243,.65)">{label}</td>
-              <td style="padding:6px 10px;font-weight:900">{val}</td>
-            </tr>
-            """
-
-        return HTMLResponse(f"""
-        <!doctype html>
-        <html>
-        <head>
-          <meta name="viewport" content="width=device-width, initial-scale=1" />
-          <title>Lead #{lead.id}</title>
-          <style>
-            body {{ margin:0; background:#0b0f17; color:#e6edf3; font-family:system-ui; }}
-            .wrap {{ max-width:820px; margin:20px auto; padding:18px; }}
-            .card {{ background:#0f1624; border:1px solid rgba(50,74,110,.25); border-radius:16px; padding:16px; }}
-            h2 {{ margin:0 0 6px 0; }}
-            .muted {{ opacity:.7; font-size:13px; }}
-            table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
-            tr {{ border-bottom:1px solid rgba(50,74,110,.2); }}
-            a {{ color:#8ab4f8; text-decoration:none; }}
-          </style>
-        </head>
-        <body>
-          <div class="wrap">
-            <div class="card">
-              <h2>{lead.full_name or "Unknown"}</h2>
-              <div class="muted">{lead.phone} · {lead.email or "-"}</div>
-
-              <h3 style="margin-top:18px;">📞 Call Prep</h3>
-              <table>
-                {row("Tier", "tier")}
-                {row("Coverage", "coverage_requested")}
-                {row("Age", "age")}
-                {row("Smoker", "smoker")}
-                {row("Beneficiary", "beneficiary")}
-                {row("Source", "source_type")}
-                {row("Vendor", "source_vendor")}
-                {row("Notes", "notes")}
-              </table>
-
-              <div style="margin-top:16px;">
-                <a href="/dashboard">← Back to dashboard</a>
-              </div>
-            </div>
-          </div>
-        </body>
-        </html>
-        """)
-    finally:
-        db.close()
 
 @app.get("/ai/plan")
 def ai_plan():
@@ -982,131 +695,9 @@ def ai_plan():
     finally:
         db.close()
 
-def execute_pending_actions(db: Session, limit: int = 5) -> Dict[str, Any]:
-    paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
-    if paused:
-        return {"ok": False, "paused": True}
-
-    nowv = _now()
-    executed = 0
-    failed = 0
-
-    actions = (
-        db.query(Action)
-        .filter(Action.status == "PENDING")
-        .order_by(Action.created_at.asc())
-        .limit(limit)
-        .with_for_update(skip_locked=True)
-        .all()
-    )
-
-    for action in actions:
-        try:
-            payload = json.loads(action.payload_json or "{}")
-
-            # Enforce due_at (for calls)
-            due_at = payload.get("due_at")
-            if due_at:
-                if nowv < datetime.fromisoformat(due_at):
-                    continue
-
-            # Enforce lead local hours (8am–8pm)
-            lead = db.query(Lead).filter_by(id=action.lead_id).first()
-            if not lead:
-                action.status = "FAILED"
-                action.error = "Lead missing"
-                failed += 1
-                continue
-
-            tz = ZoneInfo(lead.timezone or "UTC")
-            local_hour = nowv.astimezone(tz).hour
-            if local_hour < 8 or local_hour > 20:
-                continue
-
-            # Execute
-            if action.type == "TEXT":
-                send_lead_sms(payload["to"], payload["message"])
-
-            elif action.type == "CALL":
-                if _make_call:
-                    _make_call(payload["to"], payload.get("lead_id"))
-                else:
-                    raise RuntimeError("Call function not available")
-
-            else:
-                raise RuntimeError(f"Unknown action type {action.type}")
-
-            action.status = "DONE"
-            action.finished_at = _now()
-            executed += 1
-
-        except Exception as e:
-            action.status = "FAILED"
-            action.error = str(e)[:500]
-            failed += 1
-
-    db.commit()
-    return {"ok": True, "executed": executed, "failed": failed}
 
 # =========================
-# Assistant API
-# =========================
-@app.post("/api/assistant")
-async def assistant_api(payload: dict):
-    msg = (payload.get("message") or "").strip()
-    db = SessionLocal()
-    try:
-        _log(db, None, None, "ASSISTANT_COMMAND", msg)
-        db.commit()
-
-        if not msg:
-            return {"reply": "Try: counts | show pending | show newest | run planner | lead 123"}
-
-        low = msg.lower()
-        if "run" in low and "planner" in low:
-            out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
-            _log(db, None, out.get("run_id"), "ASSISTANT_RESULT", f"Planner ran: {out}")
-            db.commit()
-            return {"reply": json.dumps(out, indent=2)}
-
-        api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-        if not api_key:
-            reply = offline_assistant(db, msg)
-            _log(db, None, None, "ASSISTANT_OFFLINE_REPLY", reply[:2000])
-            db.commit()
-            return {"reply": reply}
-
-        total = db.query(Lead).count()
-        new = db.query(Lead).filter(Lead.state == "NEW").count()
-        working = db.query(Lead).filter(Lead.state == "WORKING").count()
-        dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
-        pending = db.query(Action).filter(Action.status == "PENDING").count()
-        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
-
-        failed = (
-            db.query(Action)
-            .filter(Action.status == "FAILED")
-            .order_by(Action.finished_at.desc().nullslast(), Action.id.desc())
-            .limit(5)
-            .all()
-        )
-        failed_lines = [f"Action#{a.id} {a.type} lead={a.lead_id} err={(a.error or '')[:160]}" for a in failed]
-
-        context = (
-            f"Counts: total={total} NEW={new} WORKING={working} DNC={dnc} pending_actions={pending} paused={paused}\n"
-            "Recent failures:\n" + ("\n".join(failed_lines) if failed_lines else "None.")
-        )
-
-        reply = await llm_reply(msg, context=context)
-        _log(db, None, None, "ASSISTANT_REPLY", reply[:2000])
-        db.commit()
-        return {"reply": reply}
-    finally:
-        db.close()
-
-
-# =========================
-# Dashboard helpers
+# Dashboard UI helpers
 # =========================
 def _kpi_card(label: str, value: Any, sub: str = "") -> str:
     return f"""
@@ -1132,18 +723,41 @@ def _svg_donut(pct: float) -> str:
     </svg>
     """
 
-
-# =========================
-# Dashboard
-# =========================
-@app.get("/worker/execute")
-def worker_execute(limit: int = 5):
-    db = SessionLocal()
+def _fmt_dt(s: str) -> str:
     try:
-        return execute_pending_actions(db, limit=limit)
-    finally:
-        db.close()
+        return datetime.fromisoformat(s).strftime("%b %d %I:%M %p")
+    except Exception:
+        return s[:40]
 
+def _upcoming_appts(db: Session, limit: int = 8) -> List[Dict[str, str]]:
+    """
+    Appointment memory convention:
+      key="appt_time_iso" value="2026-01-06T10:30:00"
+      key="appt_tz" value="America/Chicago"
+      key="appt_note" value="..."
+    """
+    # Simple scan: take newest leads and show if they have appt_time_iso
+    leads = db.query(Lead).order_by(Lead.updated_at.desc()).limit(200).all()
+    out = []
+    for l in leads:
+        t = mem_get(db, l.id, "appt_time_iso")
+        if not t:
+            continue
+        out.append({
+            "lead_id": str(l.id),
+            "name": l.full_name or "Unknown",
+            "when": _fmt_dt(t),
+            "tz": mem_get(db, l.id, "appt_tz") or (l.timezone or ""),
+            "note": (mem_get(db, l.id, "appt_note") or "")[:80],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+# =========================
+# Dashboard (mobile-safe, no sideways scroll)
+# =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db = SessionLocal()
@@ -1154,7 +768,6 @@ def dashboard():
         contacted = db.query(Lead).filter(Lead.state == "CONTACTED").count()
         dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
         pending = db.query(Action).filter(Action.status == "PENDING").count()
-        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
 
         logs = db.query(AuditLog).order_by(AuditLog.created_at.desc()).limit(18).all()
         feed = ""
@@ -1163,31 +776,36 @@ def dashboard():
             <div class="feed-item">
               <div class="feed-top">
                 <div class="feed-title">{l.event}</div>
-                <div class="feed-time">{l.created_at}</div>
+                <div class="feed-time">{str(l.created_at)[:19]}</div>
               </div>
               <div class="feed-meta">lead={l.lead_id} run={l.run_id}</div>
-              <div class="feed-body">{(l.detail or "")[:280]}</div>
+              <div class="feed-body">{(l.detail or "")[:260]}</div>
             </div>
             """
 
         leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(10).all()
         leads_html = ""
         for l in leads:
-            us_state = getattr(l, "us_state", None) or "-"
-            cov = getattr(l, "coverage_requested", None) or "-"
+            mem = {m.key: m.value for m in db.query(LeadMemory).filter(LeadMemory.lead_id == l.id).all()}
+            us_state = mem.get("us_state") or mem.get("state") or "-"
+            cov = mem.get("coverage_requested") or "-"
+            tier = mem.get("tier") or "-"
+            prod = mem.get("product_interest") or mem.get("coverage_type") or "-"
             leads_html += f"""
             <div class="lead-row">
-              <div>
+              <div class="lead-main">
                 <div class="lead-name"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a></div>
                 <div class="lead-meta">{l.phone or "-"} | {l.email or "-"}</div>
-                <div class="lead-meta">US State: {us_state} | Coverage: {cov}</div>
+                <div class="lead-meta">Tier: {tier} | Product: {prod} | US: {us_state} | Coverage: {cov}</div>
               </div>
-              <div class="lead-badges">
-                <span class="pill">{l.state}</span>
-                <form method="post" action="/leads/delete/{l.id}" style="margin:0"
-                      onsubmit="return confirm('Delete lead #{l.id}?');">
-                  <button class="mini danger" type="submit">Delete</button>
+              <div class="lead-actions">
+                <form method="post" action="/leads/{l.id}/text-now" style="margin:0">
+                  <button class="mini" type="submit">Text Now</button>
                 </form>
+                <form method="post" action="/leads/{l.id}/call-now" style="margin:0">
+                  <button class="mini" type="submit">Call Now</button>
+                </form>
+                <span class="pill">{l.state}</span>
               </div>
             </div>
             """
@@ -1198,15 +816,27 @@ def dashboard():
         pct_contacted = (contacted / denom) * 100.0
         pct_dnc = (dnc / denom) * 100.0
 
-        pause_label = "Resume Work" if paused else "Pause Work"
-        pause_sub = "Paused" if paused else "Running"
+        appts = _upcoming_appts(db, limit=8)
+        appt_html = ""
+        for a in appts:
+            appt_html += f"""
+            <div class="appt">
+              <div class="appt-top">
+                <div class="appt-title"><a href="/leads/{a["lead_id"]}">#{a["lead_id"]} {a["name"]}</a></div>
+                <div class="appt-when">{a["when"]} {a["tz"]}</div>
+              </div>
+              <div class="appt-note">{a["note"] or ""}</div>
+            </div>
+            """
+        if not appt_html:
+            appt_html = '<div class="muted">No appointments stored yet. (Google sync will slot in here.)</div>'
 
         return HTMLResponse(f"""
 <!doctype html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>AgencyVault - Command Center</title>
+<title>AgencyVault - AI Employee</title>
 <style>
   :root {{
     --bg:#0b0f17;
@@ -1217,30 +847,33 @@ def dashboard():
     --muted:rgba(230,237,243,.72);
     --link:#8ab4f8;
   }}
-  body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; overflow-x:hidden; }}
   a {{ color:var(--link); text-decoration:none; }}
   a:hover {{ text-decoration:underline; }}
-  .wrap {{ display:grid; grid-template-columns: 260px 1fr 360px; min-height:100vh; }}
+
+  .wrap {{ display:grid; grid-template-columns: 260px 1fr; min-height:100vh; }}
   .sidebar {{ border-right:1px solid var(--border); padding:16px 14px; position:sticky; top:0; height:100vh; overflow:auto;
              background:linear-gradient(180deg, rgba(17,24,39,.55), rgba(11,15,23,.55)); }}
-  .brand {{ font-weight:900; letter-spacing:.2px; font-size:20px; margin-bottom:10px; }}
-  .nav {{ display:flex; flex-direction:column; gap:8px; margin-top:12px; }}
-  .nav a {{ display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:12px; border:1px solid rgba(50,74,110,.15); background:rgba(15,22,36,.55); }}
-  .nav a:hover {{ border-color:rgba(138,180,248,.55); }}
-  .nav small {{ color:var(--muted); display:block; margin-left:28px; margin-top:-6px; }}
-
-  .main {{ padding:18px 18px 30px 18px; }}
-  .topbar {{ display:flex; justify-content:space-between; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-bottom:14px; }}
-  .title {{ font-size:28px; font-weight:900; }}
+  .brand {{ font-weight:900; letter-spacing:.2px; font-size:20px; margin-bottom:6px; }}
   .subtitle {{ color:var(--muted); font-size:13px; }}
+  .nav {{ display:flex; flex-direction:column; gap:8px; margin-top:14px; }}
+  .nav a {{ display:block; padding:10px 12px; border-radius:12px; border:1px solid rgba(50,74,110,.15); background:rgba(15,22,36,.55); }}
+  .nav a:hover {{ border-color:rgba(138,180,248,.55); }}
+
+  .main {{ padding:18px; max-width:1200px; width:100%; }}
+  .topbar {{ display:flex; justify-content:space-between; align-items:flex-end; gap:14px; flex-wrap:wrap; margin-bottom:14px; }}
+  .title {{ font-size:26px; font-weight:900; }}
+  .sub {{ color:var(--muted); font-size:13px; }}
+
   .kpis {{ display:grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap:10px; margin-top:12px; }}
-  .kpi {{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:12px; }}
+  .kpi {{ background:var(--panel); border:1px solid var(--border); border-radius:16px; padding:12px; min-width:0; }}
   .kpi-label {{ color:var(--muted); font-size:12px; }}
   .kpi-value {{ font-size:22px; font-weight:900; margin-top:2px; }}
   .kpi-sub {{ color:var(--muted); font-size:12px; margin-top:4px; }}
 
   .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px; }}
-  .panel {{ background:var(--panel); border:1px solid var(--border); border-radius:18px; padding:14px; }}
+  .panel {{ background:var(--panel); border:1px solid var(--border); border-radius:18px; padding:14px; min-width:0; }}
   .panel h2 {{ margin:0 0 10px 0; font-size:16px; font-weight:900; letter-spacing:.2px; }}
 
   .feed-item {{ padding:10px 0; border-bottom:1px solid var(--border); }}
@@ -1250,37 +883,37 @@ def dashboard():
   .feed-meta {{ color:var(--muted); font-size:12px; margin-top:2px; }}
   .feed-body {{ margin-top:6px; color:rgba(230,237,243,.9); }}
 
-  .lead-row {{ display:flex; justify-content:space-between; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--border); }}
-  .lead-name {{ font-weight:800; }}
-  .lead-meta {{ color:var(--muted); font-size:12px; margin-top:2px; }}
-  .lead-badges {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
+  .lead-row {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }}
+  .lead-main {{ min-width:0; }}
+  .lead-name {{ font-weight:900; }}
+  .lead-meta {{ color:var(--muted); font-size:12px; margin-top:2px; word-break:break-word; }}
+  .lead-actions {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }}
   .pill {{ padding:3px 9px; border-radius:999px; border:1px solid rgba(138,180,248,.25); background:rgba(17,24,39,.6); font-size:12px; color:rgba(230,237,243,.9); }}
 
-  .right {{ border-left:1px solid var(--border); padding:16px 14px; position:sticky; top:0; height:100vh; overflow:auto;
-            background:linear-gradient(180deg, rgba(15,22,36,.55), rgba(11,15,23,.55)); }}
-
   .btn {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:10px 12px; border-radius:12px;
-         border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text); cursor:pointer; text-decoration:none; font-weight:700; }}
+         border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text); cursor:pointer; text-decoration:none; font-weight:800; }}
   .btn:hover {{ border-color:rgba(138,180,248,.6); }}
   .mini {{ padding:7px 10px; border-radius:10px; border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:var(--text);
-          cursor:pointer; font-weight:800; font-size:12px; }}
-  .danger {{ background:rgba(192,58,58,.18); border-color:rgba(192,58,58,.35); }}
-  .danger:hover {{ border-color:rgba(192,58,58,.65); }}
+          cursor:pointer; font-weight:900; font-size:12px; }}
 
   textarea {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:14px;
             padding:12px; min-height:110px; font-size:14px; outline:none; }}
   pre {{ white-space:pre-wrap; margin:10px 0 0 0; color:rgba(230,237,243,.9); font-size:13px; }}
-  input, select {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:12px; padding:10px; outline:none; }}
+  input {{ width:100%; background:rgba(11,15,23,.75); color:var(--text); border:1px solid rgba(50,74,110,.35); border-radius:12px; padding:10px; outline:none; }}
   .muted {{ color:var(--muted); font-size:12px; }}
 
-  .donuts {{ display:grid; grid-template-columns: repeat(2, 1fr); gap:10px; }}
+  .donuts {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:10px; }}
   .donut-card {{ background:var(--panel2); border:1px solid var(--border); border-radius:16px; padding:12px; display:flex; align-items:center; justify-content:space-between; gap:10px; }}
-  .donut-label {{ font-weight:900; }}
-  .donut-sub {{ color:var(--muted); font-size:12px; margin-top:2px; }}
+
+  .appt {{ padding:10px 0; border-bottom:1px solid rgba(50,74,110,.22); }}
+  .appt-top {{ display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; }}
+  .appt-title {{ font-weight:900; }}
+  .appt-when {{ color:var(--muted); font-size:12px; }}
+  .appt-note {{ margin-top:6px; color:rgba(230,237,243,.9); font-size:13px; }}
 
   @media (max-width: 1100px) {{
     .wrap {{ grid-template-columns: 1fr; }}
-    .sidebar, .right {{ position:relative; height:auto; border:none; }}
+    .sidebar {{ position:relative; height:auto; border-right:none; }}
     .kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     .grid {{ grid-template-columns: 1fr; }}
   }}
@@ -1289,37 +922,35 @@ def dashboard():
 <body>
 
 <div class="wrap">
-
   <aside class="sidebar">
     <div class="brand">AgencyVault</div>
-    <div class="subtitle">Life Insurance Command Center</div>
+    <div class="subtitle">AI Employee for Life Insurance</div>
 
     <div class="nav">
-      <a href="/dashboard">Dashboard<small>Command Center</small></a>
-      <a href="/leads">All Leads<small>Search and filter</small></a>
-      <a href="/leads/new">Add Lead<small>Manual entry</small></a>
-      <a href="/imports">Imports<small>CSV, Google, Images, PDF</small></a>
-      <a href="/actions">Action Queue<small>Calls/texts planned</small></a>
-      <a href="/activity">Activity Log<small>What happened</small></a>
-      <a href="/admin">Admin<small>Mass delete and pause</small></a>
-      <a href="/ai/plan">Run Planner<small>Create PENDING actions</small></a>
+      <a href="/dashboard">Dashboard</a>
+      <a href="/leads">All Leads</a>
+      <a href="/leads/new">Add Lead</a>
+      <a href="/actions">Action Queue</a>
+      <a href="/activity">Activity Log</a>
+      <a href="/ai/plan">Run Planner</a>
+      <a href="/worker/execute?limit=5">Run Worker (Execute)</a>
     </div>
 
     <div style="margin-top:14px" class="muted">
-      Tip: AI box accepts "counts", "show pending", "show newest", "run planner".
+      Imports are on the dashboard. Phone is mandatory.
     </div>
   </aside>
 
   <main class="main">
     <div class="topbar">
       <div>
-        <div class="title">Command Center</div>
-        <div class="subtitle">Everything important is visible right here.</div>
+        <div class="title">AI Employee Command Center</div>
+        <div class="sub">You take the reins whenever you want. It runs the machine.</div>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <a class="btn" href="/leads/new">Add Lead</a>
         <a class="btn" href="/leads">Browse Leads</a>
-        <a class="btn" href="/imports">Import</a>
+        <a class="btn" href="/worker/execute?limit=5">Execute Now</a>
       </div>
     </div>
 
@@ -1329,23 +960,57 @@ def dashboard():
       {_kpi_card("WORKING", working, "In outreach")}
       {_kpi_card("CONTACTED", contacted, "Hot replies / progressed")}
       {_kpi_card("DNC", dnc, "Compliance")}
-      {_kpi_card("Pending Actions", pending, f"Planner {pause_sub}")}
+      {_kpi_card("Pending Actions", pending, "Queued")}
     </div>
 
     <div class="grid">
       <div class="panel">
         <h2>Distribution</h2>
         <div class="donuts">
-          <div class="donut-card"><div><div class="donut-label">NEW</div><div class="donut-sub">{new} of {total}</div></div>{_svg_donut(pct_new)}</div>
-          <div class="donut-card"><div><div class="donut-label">WORKING</div><div class="donut-sub">{working} of {total}</div></div>{_svg_donut(pct_working)}</div>
-          <div class="donut-card"><div><div class="donut-label">CONTACTED</div><div class="donut-sub">{contacted} of {total}</div></div>{_svg_donut(pct_contacted)}</div>
-          <div class="donut-card"><div><div class="donut-label">DNC</div><div class="donut-sub">{dnc} of {total}</div></div>{_svg_donut(pct_dnc)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div>{_svg_donut(pct_new)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div>{_svg_donut(pct_working)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div>{_svg_donut(pct_contacted)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div>{_svg_donut(pct_dnc)}</div>
         </div>
       </div>
 
       <div class="panel">
-        <h2>Newest Leads</h2>
+        <h2>Imports (No Guessing)</h2>
+
+        <div class="muted" style="margin-bottom:8px;">Upload CSV</div>
+        <form action="/import/csv" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".csv" />
+          <div style="margin-top:8px;"><button class="btn" type="submit">Upload CSV</button></div>
+        </form>
+
+        <div class="muted" style="margin:14px 0 8px;">Upload PDF (typed PDFs)</div>
+        <form action="/import/pdf" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept=".pdf,application/pdf" />
+          <div style="margin-top:8px;"><button class="btn" type="submit">Upload PDF</button></div>
+        </form>
+
+        <div class="muted" style="margin:14px 0 8px;">Upload Image (JPG/PNG)</div>
+        <form action="/import/image" method="post" enctype="multipart/form-data">
+          <input type="file" name="file" accept="image/*" />
+          <div style="margin-top:8px;"><button class="btn" type="submit">Upload Image</button></div>
+        </form>
+
+        <div class="muted" style="margin-top:12px;">
+          Notes: Phone is mandatory. If Twilio is blocked (10DLC), actions will show FAILED with the real error.
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Newest Leads (Text/Call buttons)</h2>
         <div>{leads_html or '<div class="muted">No leads yet.</div>'}</div>
+      </div>
+
+      <div class="panel">
+        <h2>Calendar (Easy to see)</h2>
+        {appt_html}
+        <div style="margin-top:10px" class="muted">
+          Google Calendar sync is scaffolded: once OAuth is added, appts will push automatically.
+        </div>
       </div>
 
       <div class="panel">
@@ -1354,70 +1019,44 @@ def dashboard():
       </div>
 
       <div class="panel">
-        <h2>Schedule</h2>
-        <div class="muted" style="margin-bottom:10px;">
-          Calendar sync will be added after imports + texting is confirmed stable.
+        <h2>AI Employee (Offline-first)</h2>
+        <div class="muted">Commands: counts | run planner | execute | lead 123 | wake rules</div>
+        <textarea id="cmd" placeholder="Try: counts"></textarea>
+        <div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">
+          <button class="btn" onclick="send()">Send</button>
+          <button class="btn" onclick="document.getElementById('cmd').value='counts'; send();">Counts</button>
+          <button class="btn" onclick="document.getElementById('cmd').value='run planner'; send();">Run Planner</button>
+          <button class="btn" onclick="document.getElementById('cmd').value='execute'; send();">Execute</button>
+        </div>
+        <pre id="out" class="muted"></pre>
+
+        <div style="margin-top:10px" class="muted">
+          Live call screen + transcript: requires Twilio Media Streams + a websocket service.
+          This build includes placeholders and logging now; we wire live transcript next.
         </div>
       </div>
+
     </div>
   </main>
-
-  <aside class="right">
-    <div class="panel" style="padding:14px;">
-      <h2>AI Employee</h2>
-      <div class="muted">If OpenAI is off, it uses Offline Assistant.</div>
-      <textarea id="cmd" placeholder="Try: counts | show pending | show newest | lead 12 | run planner"></textarea>
-      <div style="display:flex; gap:10px; margin-top:10px;">
-        <button class="btn" onclick="send()">Send</button>
-        <button class="btn" onclick="document.getElementById('cmd').value='counts'; send();">Counts</button>
-        <button class="btn" onclick="document.getElementById('cmd').value='run planner'; send();">Run Planner</button>
-      </div>
-      <pre id="out" class="muted"></pre>
-    </div>
-
-    <div class="panel" style="margin-top:12px;">
-      <h2 id="imports">Imports (Right Here)</h2>
-
-      <div class="muted" style="margin-bottom:8px;">Upload CSV</div>
-      <form action="/import/csv" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".csv" />
-        <div style="margin-top:8px;"><button class="btn" type="submit">Upload CSV</button></div>
-      </form>
-
-      <div class="muted" style="margin:14px 0 8px;">Upload Image (JPG/PNG)</div>
-      <form action="/import/image" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept="image/*" />
-        <div style="margin-top:8px;"><button class="btn" type="submit">Upload Image</button></div>
-      </form>
-
-      <div class="muted" style="margin:14px 0 8px;">Upload PDF (typed PDFs)</div>
-      <form action="/import/pdf" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".pdf,application/pdf" />
-        <div style="margin-top:8px;"><button class="btn" type="submit">Upload PDF</button></div>
-      </form>
-    </div>
-
-  </aside>
-
 </div>
 
 <script>
-async function send() {{
+async function send() {
   const msg = document.getElementById("cmd").value;
   const out = document.getElementById("out");
-  out.textContent = "Thinking...";
-  try {{
-    const r = await fetch("/api/assistant", {{
+  out.textContent = "Working...";
+  try {
+    const r = await fetch("/api/assistant", {
       method: "POST",
-      headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ message: msg }})
-    }});
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: msg })
+    });
     const d = await r.json();
     out.textContent = d.reply || "OK";
-  }} catch (e) {{
+  } catch (e) {
     out.textContent = "Error: " + e;
-  }}
-}}
+  }
+}
 </script>
 </body>
 </html>
@@ -1426,114 +1065,9 @@ async function send() {{
         db.close()
 
 
-@app.get("/imports", response_class=HTMLResponse)
-def imports_page():
-    return RedirectResponse("/dashboard#imports", status_code=303)
-
-
 # =========================
-# Imports (ONE route each - no duplicates)
+# Imports (ONE route each)
 # =========================
-@app.post("/import/pdf")
-async def import_pdf(file: UploadFile = File(...)):
-    db = SessionLocal()
-    try:
-        data = await file.read()
-        if not data:
-            return HTMLResponse("Empty upload", status_code=400)
-
-        # Extract all text from the PDF
-        text_data = extract_text_from_pdf_bytes(data)
-        if not (text_data or "").strip():
-            _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable PDF text")
-            db.commit()
-            return RedirectResponse("/dashboard", status_code=303)
-
-        # Normalize into structured lead dicts
-        leads = normalize_to_leads(text_data)
-
-        created = 0
-        merged = 0
-        skipped = 0
-        errors = 0
-
-        for item in leads:
-            try:
-                # --- DEFINE VARIABLES FIRST (NO NameError POSSIBLE) ---
-                phone = normalize_phone(item.get("phone") or "")
-                email = clean_text(item.get("email") or "")
-                full_name = clean_text(item.get("full_name") or "")
-                tz = infer_timezone_from_phone(phone) if phone else None
-
-                # Require at least one contact method
-                if not phone and not email:
-                    skipped += 1
-                    continue
-
-                # Dedupe / merge
-                existing = None
-                if phone:
-                    existing = db.query(Lead).filter(Lead.phone == phone).first()
-                elif email:
-                    existing = db.query(Lead).filter(Lead.email == email).first()
-
-                if existing:
-                    # Merge extra fields into LeadMemory
-                    for k, v in item.items():
-                        if k in ["full_name", "phone", "email"] or not v:
-                            continue
-                        _mem_upsert(db, existing.id, k, str(v))
-                    merged += 1
-                    continue
-
-                # --- CREATE LEAD (ONLY VALID MODEL FIELDS) ---
-                lead = Lead(
-                    full_name=full_name or "Unknown",
-                    phone=phone or "UNKNOWN",
-                    email=email or None,
-                    state="NEW",
-                    timezone=tz,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                db.add(lead)
-                db.flush()  # REQUIRED
-
-                # --- STORE ALL EXTRA DATA SAFELY ---
-                for k, v in item.items():
-                    if k in ["full_name", "phone", "email"] or not v:
-                        continue
-                    _mem_upsert(db, lead.id, k, str(v))
-
-                created += 1
-
-            except Exception as e:
-                errors += 1
-                _log(db, None, None, "PDF_IMPORT_ROW_ERROR", str(e)[:300])
-
-        _log(
-            db,
-            None,
-            None,
-            "IMPORT_PDF",
-            f"created={created} merged={merged} skipped={skipped} errors={errors}",
-        )
-
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-
-    finally:
-        db.close()
-
-def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
-    rows = (
-        db.query(LeadMemory)
-        .filter(LeadMemory.lead_id == lead_id)
-        .order_by(LeadMemory.key.asc())
-        .all()
-    )
-    return {r.key: r.value for r in rows}
-    
 @app.post("/import/csv")
 async def import_csv(file: UploadFile = File(...)):
     db = SessionLocal()
@@ -1542,160 +1076,131 @@ async def import_csv(file: UploadFile = File(...)):
         if not content:
             return RedirectResponse("/dashboard", status_code=303)
 
-        text = content.decode("utf-8", errors="ignore")
-        reader = csv.reader(io.StringIO(text))
+        text_data = content.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(text_data))
         rows = list(reader)
 
-        leads = normalize_to_leads(rows)
+        items = normalize_csv_rows(rows)
 
-        imported = 0
+        created = 0
         merged = 0
         skipped = 0
 
-        for item in leads:
-            phone = normalize_phone(item.get("phone") or "")
-            email = clean_text(item.get("email") or "")
-
-            if not phone and not email:
+        for it in items:
+            res = import_one_lead(db, it, source_tag="csv")
+            if res.get("skipped"):
                 skipped += 1
-                continue
-
-            existing = None
-            if phone:
-                existing = db.query(Lead).filter(Lead.phone == phone).first()
-            elif email:
-                existing = db.query(Lead).filter(Lead.email == email).first()
-
-            if existing:
-                # merge
-                for k, v in item.items():
-                    if k in ["full_name", "phone", "email"] or not v:
-                        continue
-                    _mem_upsert(db, existing.id, k, str(v))
+            elif res.get("merged"):
                 merged += 1
-                continue
+            elif res.get("created"):
+                created += 1
 
-            lead = Lead(
-                full_name=item.get("full_name") or "Unknown",
-                phone=phone or "UNKNOWN",
-                email=email or None,
-                state="NEW",
-                timezone=infer_timezone_from_phone(phone) if phone else None,
-                created_at=_now(),
-                updated_at=_now(),
-            )
-            db.add(lead)
-            db.flush()
-
-            for k, v in item.items():
-                if k in ["full_name", "phone", "email"] or not v:
-                    continue
-                _mem_upsert(db, lead.id, k, str(v))
-
-            imported += 1
-
-        _log(db, None, None, "IMPORT_CSV",
-             f"imported={imported} merged={merged} skipped={skipped}")
-
+        _log(db, None, None, "IMPORT_CSV", f"created={created} merged={merged} skipped={skipped} rows={len(rows)}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
-
     finally:
         db.close()
 
+@app.post("/import/pdf")
+async def import_pdf(file: UploadFile = File(...)):
+    if not PDF_OK:
+        return HTMLResponse("PDF support not installed (pypdf missing).", status_code=400)
 
-@app.post("/import/image")
-async def import_image(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
         data = await file.read()
         if not data:
-            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
+            return HTMLResponse("Empty upload", status_code=400)
 
-        text_data = extract_text_from_image_bytes(data)
+        text_data = extract_text_from_pdf_bytes(data)
         if not (text_data or "").strip():
-            _log(db, None, None, "IMPORT_IMAGE_EMPTY", "OCR not available or no text extracted")
+            _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable PDF text")
             db.commit()
             return RedirectResponse("/dashboard", status_code=303)
 
-        leads = normalize_to_leads(text_data)
-        added = 0
-        for lead in leads:
-            if _import_row(db, lead):
-                added += 1
+        items = normalize_text_to_leads(text_data)
 
-        _log(db, None, None, "IMPORT_IMAGE", f"imported={added}")
+        created = 0
+        merged = 0
+        skipped = 0
+
+        for it in items:
+            # Always store source filename/page context when possible
+            it["source_filename"] = clean_text(file.filename or "uploaded.pdf")
+            res = import_one_lead(db, it, source_tag="pdf")
+            if res.get("skipped"):
+                skipped += 1
+            elif res.get("merged"):
+                merged += 1
+            elif res.get("created"):
+                created += 1
+
+        _log(db, None, None, "IMPORT_PDF", f"created={created} merged={merged} skipped={skipped} blocks={len(items)}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
-    except Exception as e:
-        _log(db, None, None, "IMPORT_IMAGE_ERROR", str(e)[:2000])
-        db.commit()
-        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Image Import Error: {str(e)[:500]}</div>", status_code=400)
     finally:
         db.close()
+
+@app.post("/import/image")
+async def import_image(file: UploadFile = File(...)):
+    if not OCR_OK:
+        return HTMLResponse("OCR not installed (pytesseract/PIL missing).", status_code=400)
+
+    db = SessionLocal()
+    try:
+        data = await file.read()
+        if not data:
+            return HTMLResponse("Empty upload", status_code=400)
+
+        text_data = extract_text_from_image_bytes(data)
+        if not (text_data or "").strip():
+            _log(db, None, None, "IMPORT_IMAGE_EMPTY", "No readable OCR text")
+            db.commit()
+            return RedirectResponse("/dashboard", status_code=303)
+
+        items = normalize_text_to_leads(text_data)
+
+        created = 0
+        merged = 0
+        skipped = 0
+
+        for it in items:
+            it["source_filename"] = clean_text(file.filename or "uploaded_image")
+            res = import_one_lead(db, it, source_tag="image")
+            if res.get("skipped"):
+                skipped += 1
+            elif res.get("merged"):
+                merged += 1
+            elif res.get("created"):
+                created += 1
+
+        _log(db, None, None, "IMPORT_IMAGE", f"created={created} merged={merged} skipped={skipped} blocks={len(items)}")
+        db.commit()
+        return RedirectResponse("/dashboard", status_code=303)
+    finally:
+        db.close()
+
+
 # =========================
 # Leads: Add + List + Detail + Delete
 # =========================
-@app.get("/leads/{lead_id}")
-def lead_detail(lead_id: int):
-    db = SessionLocal()
-    try:
-        lead = db.query(Lead).filter_by(id=lead_id).first()
-        if not lead:
-            return HTMLResponse("Lead not found", status_code=404)
-
-        mem = get_lead_memory_dict(db, lead.id)
-
-        def row(label, key):
-            val = mem.get(key)
-            if not val:
-                return ""
-            return f"<tr><td style='padding:4px 8px;color:#9fb3c8'>{label}</td><td style='padding:4px 8px;color:#e6edf3'><b>{val}</b></td></tr>"
-
-        html = f"""
-        <div style="max-width:700px;margin:20px auto;font-family:system-ui">
-          <h2>{lead.full_name}</h2>
-          <div style="opacity:.8">{lead.phone} · {lead.email or ""}</div>
-
-          <div style="margin-top:16px;padding:14px;border-radius:10px;background:#0f1624;border:1px solid #1f2a44">
-            <h3 style="margin-top:0">📞 Call Prep</h3>
-            <table>
-              {row("Tier", "tier")}
-              {row("Coverage", "coverage_requested")}
-              {row("Age", "age")}
-              {row("Smoker", "smoker")}
-              {row("Beneficiary", "beneficiary")}
-              {row("Source", "source_type")}
-              {row("Vendor", "source_vendor")}
-            </table>
-          </div>
-
-          <div style="margin-top:16px">
-            <a href="/dashboard" style="color:#7dd3fc">← Back to dashboard</a>
-          </div>
-        </div>
-        """
-        return HTMLResponse(html)
-    finally:
-        db.close()
-
 @app.get("/leads/new", response_class=HTMLResponse)
 def leads_new_form():
     return HTMLResponse("""
     <html><body style="font-family:system-ui;padding:24px;background:#0b0f17;color:#e6edf3;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
+      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">Back</a>
       <h2 style="margin-top:12px;">Add Lead</h2>
       <form method="post" action="/leads/new" style="margin-top:14px;">
         <div style="opacity:.8">Full Name</div>
         <input name="full_name" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
         <br><br>
-        <div style="opacity:.8">Phone</div>
+        <div style="opacity:.8">Phone (required)</div>
         <input name="phone" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
         <br><br>
         <div style="opacity:.8">Email</div>
         <input name="email" style="width:100%;padding:10px;border-radius:10px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
         <br><br>
-        <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:800;">
+        <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
           Create Lead
         </button>
       </form>
@@ -1707,28 +1212,31 @@ def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = For
     db = SessionLocal()
     try:
         p = normalize_phone(phone)
-        e = clean_text(email)
-        n = clean_text(full_name) or "Unknown"
-
         if not p:
-            return HTMLResponse("<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Invalid phone.</div>", status_code=400)
+            return HTMLResponse("<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Invalid phone (required).</div>", status_code=400)
+
+        e = clean_text(email)
+        n = safe_full_name(full_name)
 
         if dedupe_exists(db, p, e):
             return HTMLResponse("<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Duplicate lead.</div>", status_code=409)
 
         tz = infer_timezone_from_phone(p)
 
-        db.add(Lead(
+        lead = Lead(
             full_name=n,
             phone=p,
-            email=e,
+            email=e or None,
             state="NEW",
             timezone=tz,
             created_at=_now(),
             updated_at=_now(),
-        ))
+        )
+        db.add(lead)
+        db.flush()
 
-        _log(db, None, None, "LEAD_CREATED", f"{n} {p}")
+        mem_set(db, lead.id, "source_tag", "manual")
+        _log(db, lead.id, None, "LEAD_CREATED", f"{n} {p}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
     finally:
@@ -1744,21 +1252,29 @@ def leads_list(search: str = "", state: str = ""):
         if search:
             s = f"%{search.strip()}%"
             q = q.filter((Lead.full_name.ilike(s)) | (Lead.phone.ilike(s)) | (Lead.email.ilike(s)))
+
         leads = q.order_by(Lead.created_at.desc()).limit(250).all()
 
         rows = ""
         for l in leads:
-            us_state = getattr(l, "us_state", None) or "-"
-            cov = getattr(l, "coverage_requested", None) or "-"
+            mem = {m.key: m.value for m in db.query(LeadMemory).filter(LeadMemory.lead_id == l.id).all()}
+            us_state = mem.get("us_state") or "-"
+            cov = mem.get("coverage_requested") or "-"
+            tier = mem.get("tier") or "-"
             rows += f"""
-            <div style="padding:12px 0;border-bottom:1px solid rgba(50,74,110,.25);display:flex;justify-content:space-between;gap:12px;align-items:center;">
-              <div>
-                <div style="font-weight:900;"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a> <span style="opacity:.75;font-weight:700;">[{l.state}]</span></div>
+            <div style="padding:12px 0;border-bottom:1px solid rgba(50,74,110,.25);display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+              <div style="min-width:260px;max-width:760px;">
+                <div style="font-weight:900;"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a> <span style="opacity:.75;font-weight:800;">[{l.state}]</span></div>
                 <div style="opacity:.75;font-size:13px;margin-top:2px;">Phone: {l.phone or "-"} | Email: {l.email or "-"}</div>
-                <div style="opacity:.75;font-size:13px;margin-top:2px;">US State: {us_state} | Coverage: {cov}</div>
+                <div style="opacity:.75;font-size:13px;margin-top:2px;">Tier: {tier} | US State: {us_state} | Coverage: {cov}</div>
               </div>
-              <div style="display:flex;gap:10px;align-items:center;">
-                <a href="/leads/{l.id}" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:8px 12px;border-radius:12px;text-decoration:none;font-weight:800;">Open</a>
+              <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                <form method="post" action="/leads/{l.id}/text-now" style="margin:0">
+                  <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:8px 12px;border-radius:12px;cursor:pointer;font-weight:900;">Text Now</button>
+                </form>
+                <form method="post" action="/leads/{l.id}/call-now" style="margin:0">
+                  <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:8px 12px;border-radius:12px;cursor:pointer;font-weight:900;">Call Now</button>
+                </form>
                 <form method="post" action="/leads/delete/{l.id}" style="margin:0" onsubmit="return confirm('Delete lead #{l.id}?');">
                   <button type="submit" style="background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:8px 12px;border-radius:12px;cursor:pointer;font-weight:900;">
                     Delete
@@ -1768,9 +1284,12 @@ def leads_list(search: str = "", state: str = ""):
             </div>
             """
 
+        def sel(val: str) -> str:
+            return "selected" if state == val else ""
+
         return HTMLResponse(f"""
-        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-          <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
+        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;overflow-x:hidden;">
+          <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">Back</a>
           <h2 style="margin-top:12px;">All Leads</h2>
 
           <form method="get" action="/leads" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
@@ -1778,11 +1297,10 @@ def leads_list(search: str = "", state: str = ""):
                    style="flex:1;min-width:240px;padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
             <select name="state" style="padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3">
               <option value="">All workflow states</option>
-              <option value="NEW" {"selected" if state=="NEW" else ""}>NEW</option>
-              <option value="WORKING" {"selected" if state=="WORKING" else ""}>WORKING</option>
-              <option value="CONTACTED" {"selected" if state=="CONTACTED" else ""}>CONTACTED</option>
-              <option value="APPT_PENDING" {"selected" if state=="APPT_PENDING" else ""}>APPT_PENDING</option>
-              <option value="DO_NOT_CONTACT" {"selected" if state=="DO_NOT_CONTACT" else ""}>DO_NOT_CONTACT</option>
+              <option value="NEW" {sel("NEW")}>NEW</option>
+              <option value="WORKING" {sel("WORKING")}>WORKING</option>
+              <option value="CONTACTED" {sel("CONTACTED")}>CONTACTED</option>
+              <option value="DO_NOT_CONTACT" {sel("DO_NOT_CONTACT")}>DO_NOT_CONTACT</option>
             </select>
             <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
               Filter
@@ -1800,101 +1318,96 @@ def leads_list(search: str = "", state: str = ""):
     finally:
         db.close()
 
+def get_lead_memory_dict(db: Session, lead_id: int) -> Dict[str, str]:
+    rows = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead_id)
+        .order_by(LeadMemory.key.asc())
+        .all()
+    )
+    return {r.key: r.value for r in rows}
+
 @app.get("/leads/{lead_id}", response_class=HTMLResponse)
 def lead_detail(lead_id: int):
     db = SessionLocal()
     try:
         lead = db.query(Lead).filter_by(id=lead_id).first()
         if not lead:
-            return HTMLResponse("Not found", status_code=404)
+            return HTMLResponse("Lead not found", status_code=404)
 
-        actions = db.query(Action).filter(Action.lead_id == lead_id).order_by(Action.id.desc()).limit(120).all()
-        logs = db.query(AuditLog).filter(AuditLog.lead_id == lead_id).order_by(AuditLog.created_at.desc()).limit(250).all()
-        msgs = db.query(Message).filter(Message.lead_id == lead_id).order_by(Message.created_at.desc()).limit(80).all()
+        mem = get_lead_memory_dict(db, lead.id)
 
-        def block(title, content):
+        def row(label: str, key: str) -> str:
+            v = mem.get(key)
+            if not v:
+                return ""
             return f"""
-            <div style="margin-top:22px">
-              <h3 style="margin:0 0 10px 0">{title}</h3>
-              <div style="background:#0f1624;border:1px solid rgba(50,74,110,.25);border-radius:16px;padding:14px;">
-                {content}
-              </div>
-            </div>
+            <tr>
+              <td style="padding:6px 10px;color:rgba(230,237,243,.65)">{label}</td>
+              <td style="padding:6px 10px;font-weight:900;word-break:break-word">{v}</td>
+            </tr>
             """
 
-        msg_html = "".join(
-            f"""
-            <div style="padding:10px 0;border-bottom:1px solid rgba(50,74,110,.2)">
-              <div style="font-weight:900">{m.direction} - {m.channel}</div>
-              <div style="opacity:.7;font-size:12px">{m.created_at}</div>
-              <div style="margin-top:6px;white-space:pre-wrap">{m.body}</div>
-            </div>
-            """ for m in msgs
-        ) or "<div style='opacity:.65'>No messages</div>"
-
-        action_html = "".join(
-            f"""
-            <div style="padding:10px 0;border-bottom:1px solid rgba(50,74,110,.2)">
-              <div style="font-weight:900">#{a.id} - {a.type} <span style="opacity:.75">[{a.status}]</span></div>
-              <div style="opacity:.7;font-size:12px">Tool: {a.tool}</div>
-              <pre style="margin-top:6px;white-space:pre-wrap">{a.payload_json}</pre>
-              {f"<div style='color:#ffb4b4;font-weight:800'>Error: {a.error}</div>" if a.error else ""}
-            </div>
-            """ for a in actions
-        ) or "<div style='opacity:.65'>No actions</div>"
-
-        log_html = "".join(
-            f"""
-            <div style="padding:10px 0;border-bottom:1px solid rgba(50,74,110,.2)">
-              <div style="font-weight:900">{l.event}</div>
-              <div style="opacity:.7;font-size:12px">{l.created_at}</div>
-              <div style="margin-top:6px;white-space:pre-wrap">{l.detail}</div>
-            </div>
-            """ for l in logs
-        ) or "<div style='opacity:.65'>No activity</div>"
-
-        us_state = getattr(lead, "us_state", None) or "-"
-        cov = getattr(lead, "coverage_requested", None) or "-"
-        cov_type = getattr(lead, "coverage_type", None) or "-"
-        tz = lead.timezone or "-"
-
+        # Show "call critical" fields first
         return HTMLResponse(f"""
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Lead #{lead.id}</title>
-</head>
-<body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-<a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
+        <!doctype html>
+        <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Lead #{lead.id}</title>
+          <style>
+            body {{ margin:0; background:#0b0f17; color:#e6edf3; font-family:system-ui; overflow-x:hidden; }}
+            .wrap {{ max-width:980px; margin:20px auto; padding:18px; }}
+            .card {{ background:#0f1624; border:1px solid rgba(50,74,110,.25); border-radius:16px; padding:16px; }}
+            h2 {{ margin:0 0 6px 0; }}
+            .muted {{ opacity:.7; font-size:13px; }}
+            table {{ width:100%; border-collapse:collapse; margin-top:12px; }}
+            tr {{ border-bottom:1px solid rgba(50,74,110,.2); }}
+            a {{ color:#8ab4f8; text-decoration:none; }}
+            .btn {{ display:inline-flex; align-items:center; justify-content:center; gap:8px; padding:10px 12px; border-radius:12px;
+                    border:1px solid rgba(50,74,110,.35); background:rgba(17,24,39,.75); color:#e6edf3; cursor:pointer; font-weight:900; }}
+          </style>
+        </head>
+        <body>
+          <div class="wrap">
+            <div class="card">
+              <h2>#{lead.id} {lead.full_name or "Unknown"}</h2>
+              <div class="muted">{lead.phone} | {lead.email or "-"}</div>
+              <div class="muted">Timezone: {lead.timezone or "-"}</div>
 
-<h1 style="margin:14px 0 6px 0">#{lead.id} - {lead.full_name or "Unknown"}</h1>
-<div style="display:flex;gap:18px;flex-wrap:wrap;opacity:.92">
-  <div>Phone: <b>{lead.phone or "-"}</b></div>
-  <div>Email: <b>{lead.email or "-"}</b></div>
-  <div>Workflow: <b>{lead.state}</b></div>
-  <div>US State: <b>{us_state}</b></div>
-  <div>Timezone: <b>{tz}</b></div>
-  <div>Coverage: <b>{cov}</b></div>
-  <div>Type: <b>{cov_type}</b></div>
-</div>
+              <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+                <form method="post" action="/leads/{lead.id}/text-now" style="margin:0">
+                  <button class="btn" type="submit">Text Now</button>
+                </form>
+                <form method="post" action="/leads/{lead.id}/call-now" style="margin:0">
+                  <button class="btn" type="submit">Call Now</button>
+                </form>
+                <a class="btn" href="/leads">Back</a>
+              </div>
 
-<div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
-  <form method="post" action="/leads/delete/{lead.id}" onsubmit="return confirm('Delete this lead permanently?');" style="margin:0;">
-    <button style="background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:10px 14px;border-radius:14px;cursor:pointer;font-weight:900;">
-      Delete Lead
-    </button>
-  </form>
-  <a href="/leads" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:14px;text-decoration:none;font-weight:900;">
-    Back to Leads
-  </a>
-</div>
+              <h3 style="margin-top:18px;">Call Prep</h3>
+              <table>
+                {row("Tier", "tier")}
+                {row("Product", "product_interest")}
+                {row("Coverage Requested", "coverage_requested")}
+                {row("US State", "us_state")}
+                {row("DOB", "birthdate")}
+                {row("Inquiry / Reference", "lead_reference")}
+                {row("Lead Source", "lead_source")}
+              </table>
 
-{block("Messages", msg_html)}
-{block("Actions", action_html)}
-{block("Activity Log", log_html)}
-</body>
-</html>
+              <h3 style="margin-top:18px;">Raw Notes (from PDF/OCR)</h3>
+              <div style="white-space:pre-wrap; opacity:.9; font-size:13px; background:rgba(11,15,23,.65); border:1px solid rgba(50,74,110,.25); padding:12px; border-radius:14px;">
+                {(mem.get("raw_text") or "")[:4000]}
+              </div>
+
+              <div style="margin-top:16px;">
+                <a href="/dashboard">Back to dashboard</a>
+              </div>
+            </div>
+          </div>
+        </body>
+        </html>
         """)
     finally:
         db.close()
@@ -1914,7 +1427,98 @@ def delete_lead(lead_id: int):
 
 
 # =========================
-# Actions / Activity
+# Text Now / Call Now buttons
+# =========================
+@app.post("/leads/{lead_id}/text-now")
+def text_now(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead:
+            return HTMLResponse("Lead not found", status_code=404)
+
+        first = safe_first_name(lead.full_name)
+        msg = (
+            f"Hi{(' ' + first) if first else ''}, this is Nick's office. "
+            "You requested life insurance information. "
+            "Do you want a quick quote now?"
+        )
+
+        # Create action record always
+        a = Action(
+            lead_id=lead.id,
+            type="TEXT",
+            status="PENDING",
+            tool="twilio",
+            payload_json=json.dumps({"to": lead.phone, "message": msg}),
+            created_at=_now(),
+        )
+        db.add(a)
+        db.commit()
+
+        # Try immediate send (will fail if 10DLC not approved; error will be visible in Actions page)
+        try:
+            send_lead_sms(lead.phone, msg)
+            a.status = "DONE"
+            a.finished_at = _now()
+            db.commit()
+            _log(db, lead.id, None, "TEXT_NOW_SENT", msg)
+            db.commit()
+        except Exception as e:
+            a.status = "FAILED"
+            a.error = str(e)[:500]
+            db.commit()
+            _log(db, lead.id, None, "TEXT_NOW_FAILED", str(e)[:500])
+            db.commit()
+
+        return RedirectResponse(f"/leads/{lead.id}", status_code=303)
+    finally:
+        db.close()
+
+@app.post("/leads/{lead_id}/call-now")
+def call_now(lead_id: int):
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).filter_by(id=lead_id).first()
+        if not lead:
+            return HTMLResponse("Lead not found", status_code=404)
+
+        a = Action(
+            lead_id=lead.id,
+            type="CALL",
+            status="PENDING",
+            tool="twilio",
+            payload_json=json.dumps({"to": lead.phone, "lead_id": lead.id}),
+            created_at=_now(),
+        )
+        db.add(a)
+        db.commit()
+
+        try:
+            if not _make_call:
+                raise RuntimeError("Call function not available in twilio_client.py")
+            _make_call(lead.phone, lead.id)
+            a.status = "DONE"
+            a.finished_at = _now()
+            db.commit()
+            _log(db, lead.id, None, "CALL_NOW_STARTED", f"to={lead.phone}")
+            db.commit()
+        except Exception as e:
+            a.status = "FAILED"
+            a.error = str(e)[:500]
+            db.commit()
+            _log(db, lead.id, None, "CALL_NOW_FAILED", str(e)[:500])
+            db.commit()
+
+        # Live call + transcript requires Twilio Media Streams + websocket.
+        # This build logs and captures recordings (webhook below); transcript wiring is next step.
+        return RedirectResponse(f"/leads/{lead.id}", status_code=303)
+    finally:
+        db.close()
+
+
+# =========================
+# Actions / Activity pages
 # =========================
 @app.get("/actions", response_class=HTMLResponse)
 def actions_page():
@@ -1926,14 +1530,14 @@ def actions_page():
             rows += f"""
             <div style="padding:10px 0;border-bottom:1px solid rgba(50,74,110,.25)">
               <b>#{a.id} {a.type}</b> lead={a.lead_id} <span style="opacity:.75">[{a.status}]</span>
-              <div style="opacity:.75;font-size:12px">{a.created_at} - tool={a.tool}</div>
+              <div style="opacity:.75;font-size:12px">{str(a.created_at)[:19]} tool={a.tool}</div>
               <div style="opacity:.9;white-space:pre-wrap">{(a.payload_json or "")[:260]}</div>
               <div style="color:#ffb4b4;opacity:.95">{(a.error or "")[:260]}</div>
             </div>
             """
         return HTMLResponse(f"""
-        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
+        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;overflow-x:hidden;">
+        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">Back</a>
         <h2>Action Queue</h2>
         <div style="background:#0f1624;padding:14px;border-radius:16px;border:1px solid rgba(50,74,110,.25)">
           {rows or "No actions"}
@@ -1953,13 +1557,13 @@ def activity():
             rows += f"""
             <div style="padding:10px 0;border-bottom:1px solid rgba(50,74,110,.25)">
               <b>{l.event}</b>
-              <span style="opacity:.75">lead={l.lead_id} run={l.run_id} - {l.created_at}</span>
-              <div style="white-space:pre-wrap;opacity:.95">{l.detail}</div>
+              <span style="opacity:.75">lead={l.lead_id} run={l.run_id} {str(l.created_at)[:19]}</span>
+              <div style="white-space:pre-wrap;opacity:.95">{(l.detail or "")[:1400]}</div>
             </div>
             """
         return HTMLResponse(f"""
-        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;">
-        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
+        <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:1100px;margin:0 auto;overflow-x:hidden;">
+        <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;">Back</a>
         <h2>Activity</h2>
         <div style="background:#0f1624;padding:14px;border-radius:16px;border:1px solid rgba(50,74,110,.25)">
           {rows or "No activity"}
@@ -1971,81 +1575,28 @@ def activity():
 
 
 # =========================
-# Admin
+# Twilio inbound webhooks (SMS + recording)
 # =========================
-@app.get("/admin", response_class=HTMLResponse)
-def admin_page():
-    return HTMLResponse("""
-    <html><body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:20px;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
-      <h2>Admin</h2>
-      <div style="opacity:.8;margin-bottom:14px">
-        Dangerous actions require ADMIN_TOKEN.
-      </div>
+def classify_inbound_text(body: str) -> str:
+    t = (body or "").strip().lower()
+    if any(x in t for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
+        return "STOP"
+    if any(x in t for x in ["appointment", "appt", "schedule", "book"]):
+        return "APPT"
+    if any(x in t for x in ["call me", "ready", "yes", "yep", "yeah", "now", "interested"]):
+        return "HOT"
+    if any(x in t for x in ["how much", "price", "cost", "quote", "coverage", "premium", "term", "whole", "iul", "annuity"]):
+        return "QUESTION"
+    return "NEUTRAL"
 
-      <div style="background:#0f1624;border:1px solid rgba(50,74,110,.25);border-radius:16px;padding:14px;">
-        <h3 style="margin:0 0 10px 0;color:#ffb4b4">Delete ALL Leads</h3>
-        <form method="post" action="/admin/wipe" onsubmit="return confirm('This permanently deletes everything. Are you sure?');">
-          <div style="opacity:.8">Type DELETE ALL LEADS:</div>
-          <input name="confirm" style="margin-top:8px;padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
-          <div style="margin-top:10px;">
-            <input name="token" placeholder="ADMIN_TOKEN" style="padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
-          </div>
-          <button style="margin-top:10px;background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
-            Permanently Delete
-          </button>
-        </form>
+def cancel_pending_actions(db: Session, lead_id: int, reason: str):
+    actions = db.query(Action).filter(Action.lead_id == lead_id, Action.status == "PENDING").all()
+    for a in actions:
+        a.status = "SKIPPED"
+        a.error = f"Canceled: {reason}"
+        a.finished_at = _now()
+    _log(db, lead_id, None, "ACTIONS_CANCELED", reason)
 
-        <h3 style="margin:18px 0 10px 0;">Pause or Resume Work</h3>
-        <form method="post" action="/admin/pause-toggle">
-          <input name="token" placeholder="ADMIN_TOKEN" style="padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
-          <button style="margin-left:10px;background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
-            Toggle Pause
-          </button>
-        </form>
-      </div>
-    </body></html>
-    """)
-
-@app.post("/admin/pause-toggle")
-def admin_pause_toggle(request: Request, token: str = Form("")):
-    if not require_admin(request, token_from_form=token):
-        return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Missing or invalid ADMIN_TOKEN.</div>", status_code=401)
-
-    db = SessionLocal()
-    try:
-        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
-        mem_set(db, 0, "GLOBAL_PAUSE", "0" if paused else "1")
-        _log(db, None, None, "GLOBAL_PAUSE_TOGGLED", f"paused={'0' if paused else '1'}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
-@app.post("/admin/wipe")
-async def admin_wipe(request: Request, confirm: str = Form(...), token: str = Form("")):
-    if confirm.strip() != "DELETE ALL LEADS":
-        return JSONResponse({"error": "Confirmation text does not match"}, status_code=400)
-    if not require_admin(request, token_from_form=token):
-        return JSONResponse({"error": "Missing or invalid ADMIN_TOKEN"}, status_code=401)
-
-    db = SessionLocal()
-    try:
-        db.execute(text("DELETE FROM messages"))
-        db.execute(text("DELETE FROM audit_log"))
-        db.execute(text("DELETE FROM lead_memory"))
-        db.execute(text("DELETE FROM actions"))
-        db.execute(text("DELETE FROM agent_runs"))
-        db.execute(text("DELETE FROM leads"))
-        db.commit()
-        return JSONResponse({"ok": True, "message": "Everything deleted."})
-    finally:
-        db.close()
-
-
-# =========================
-# Twilio Webhooks: inbound SMS + recordings
-# =========================
 @app.post("/twilio/sms/inbound")
 def twilio_sms_inbound(
     From: str = Form(...),
@@ -2055,8 +1606,8 @@ def twilio_sms_inbound(
 ):
     db = SessionLocal()
     try:
-        from_phone = normalize_phone(From) or From
-        to_phone = normalize_phone(To) or To
+        from_phone = normalize_phone(From) or (From or "").strip()
+        to_phone = normalize_phone(To) or (To or "").strip()
         body = (Body or "").strip()
 
         lead = db.query(Lead).filter(Lead.phone == from_phone).first()
@@ -2083,7 +1634,7 @@ def twilio_sms_inbound(
         _log(db, lead.id, None, "SMS_IN", body)
         db.commit()
 
-        # Always forward inbound reply to your phone
+        # Always forward inbound reply to you (wake for money later via escalation rules)
         notify_owner(db, lead, body, tag="LEAD_REPLIED")
 
         intent = classify_inbound_text(body)
@@ -2097,12 +1648,20 @@ def twilio_sms_inbound(
             notify_owner(db, lead, "Lead opted out (STOP/DNC).", tag="DNC")
             return Response(content="<Response></Response>", media_type="text/xml")
 
-        if intent in ["HOT", "QUESTION", "NEUTRAL", "APPT"]:
-            # You asked for conservative behavior: tell you to call / take over
-            lead.state = "CONTACTED" if intent == "HOT" else "WORKING"
-            lead.updated_at = _now()
-            db.commit()
-            notify_owner(db, lead, f"Lead reply requires your attention ({intent}). Call them.", tag="CALL_THIS_LEAD")
+        # Store quick "learning" signals (offline)
+        mem_set(db, lead.id, "last_inbound_intent", intent)
+        mem_set(db, lead.id, "last_inbound_text", body[:500])
+
+        if intent in ["HOT", "QUESTION", "APPT"]:
+            lead.state = "CONTACTED"
+        else:
+            lead.state = "WORKING"
+        lead.updated_at = _now()
+        db.commit()
+
+        # Wake rules: ALWAYS notify for HOT/APPT
+        if intent in ["HOT", "APPT"]:
+            notify_owner(db, lead, f"WAKE: Lead intent={intent}. Call now.", tag="WAKE_FOR_MONEY")
 
         return Response(content="<Response></Response>", media_type="text/xml")
     finally:
@@ -2123,26 +1682,64 @@ def twilio_recording(
         return {"ok": True}
     finally:
         db.close()
-@app.get("/test/twilio/text")
-def test_twilio_text():
+
+
+# =========================
+# Offline AI Assistant API (no OpenAI required)
+# =========================
+@app.post("/api/assistant")
+async def assistant_api(payload: dict):
+    msg = (payload.get("message") or "").strip()
     db = SessionLocal()
     try:
-        lead = db.query(Lead).order_by(Lead.created_at.desc()).first()
-        if not lead:
-            return {"ok": False, "error": "No leads found"}
-
-        db.add(Action(
-            lead_id=lead.id,
-            type="TEXT",
-            status="PENDING",
-            tool="twilio",
-            payload_json=json.dumps({
-                "to": lead.phone,
-                "message": "Twilio test: if you got this, SMS is working."
-            }),
-            created_at=_now(),
-        ))
+        _log(db, None, None, "ASSISTANT_COMMAND", msg)
         db.commit()
-        return {"ok": True, "message": "Test SMS action created"}
+
+        low = msg.lower()
+
+        if not low:
+            return {"reply": "Try: counts | run planner | execute | lead 123 | wake rules"}
+
+        if "counts" in low:
+            total = db.query(Lead).count()
+            new = db.query(Lead).filter(Lead.state == "NEW").count()
+            working = db.query(Lead).filter(Lead.state == "WORKING").count()
+            contacted = db.query(Lead).filter(Lead.state == "CONTACTED").count()
+            dnc = db.query(Lead).filter(Lead.state == "DO_NOT_CONTACT").count()
+            pend = db.query(Action).filter(Action.status == "PENDING").count()
+            return {"reply": f"Counts: total={total} NEW={new} WORKING={working} CONTACTED={contacted} DNC={dnc} pending={pend}"}
+
+        if "run planner" in low or (("run" in low) and ("planner" in low)):
+            out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
+            return {"reply": json.dumps(out, indent=2)}
+
+        if "execute" in low:
+            out = execute_pending_actions(db, limit=5)
+            return {"reply": json.dumps(out, indent=2)}
+
+        if low.startswith("lead "):
+            nums = re.findall(r"\d+", low)
+            if not nums:
+                return {"reply": "Usage: lead 123"}
+            lead_id = int(nums[0])
+            lead = db.query(Lead).filter_by(id=lead_id).first()
+            if not lead:
+                return {"reply": f"No lead with id {lead_id}"}
+            mem = get_lead_memory_dict(db, lead.id)
+            core = {
+                "id": lead.id,
+                "name": lead.full_name,
+                "phone": lead.phone,
+                "email": lead.email,
+                "workflow": lead.state,
+                "timezone": lead.timezone,
+            }
+            top = {k: mem.get(k) for k in ["tier", "product_interest", "coverage_requested", "us_state", "birthdate", "lead_reference"]}
+            return {"reply": json.dumps({"core": core, "call_prep": top}, indent=2)}
+
+        if "wake" in low and "rules" in low:
+            return {"reply": "Wake rules: HOT/APPT replies trigger WAKE_FOR_MONEY alert to OWNER_MOBILE immediately. Quiet hours do not block owner alerts."}
+
+        return {"reply": "Try: counts | run planner | execute | lead 123 | wake rules"}
     finally:
         db.close()
