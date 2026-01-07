@@ -621,6 +621,55 @@ def worker_execute(limit: int = 5):
 # =========================
 # Planner (creates PENDING actions)
 # =========================
+def ai_schedule_appointment(db, lead_id: int, note: str = "Call"):
+    """
+    AI-only scheduler.
+    Finds the next open 30-minute slot and books it.
+    """
+
+    # 1. Get existing appointments
+    appts = (
+        db.query(Action)
+        .filter(Action.kind == "APPOINTMENT")
+        .order_by(Action.created_at.asc())
+        .all()
+    )
+
+    # 2. Build blocked times (simple version)
+    blocked = []
+    for a in appts:
+        payload = a.payload or {}
+        when = payload.get("when")
+        if when:
+            blocked.append(when)
+
+    # 3. Pick next available slot (VERY SAFE DEFAULT)
+    from datetime import datetime, timedelta
+
+    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    candidate = now + timedelta(hours=1)
+
+    for _ in range(48):  # look ahead ~2 days
+        slot = candidate.strftime("%Y-%m-%d %H:%M")
+        if slot not in blocked:
+            break
+        candidate += timedelta(minutes=30)
+
+    # 4. Create appointment
+    create_task(
+        db,
+        kind="APPOINTMENT",
+        lead_id=lead_id,
+        payload={
+            "when": slot,
+            "note": note,
+            "tz": "local",
+            "name": "AI Scheduled Call",
+        },
+    )
+
+    log_event(db, "ai_schedule", f"AI scheduled call for lead {lead_id} at {slot}")
+
 def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
     run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="Planner run")
     db.add(run)
