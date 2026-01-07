@@ -639,31 +639,43 @@ def render_action(a):
         msg_html = f'<div class="muted" style="margin-top:6px;white-space:pre-wrap">{msg}</div>'
 
     return f"""
-    <div class="item">
-      <div class="top">
-        <div class="name"><a href="/leads/{a.lead_id}">#{a.lead_id} {name}</a></div>
-        <div class="tag">{a.type}</div>
-      </div>
-
-      <div class="muted"><b>DO THIS:</b> {todo}</div>
-      <div class="muted">Reason: {reason or "-"}</div>
-      {msg_html}
-
-      <form method="post" action="/agenda/report" style="margin-top:10px">
-        <input type="hidden" name="action_id" value="{a.id}" />
-
-        <textarea name="note" placeholder="Paste what they said or write quick notes (AI will decide next step)"
-          style="width:100%;min-height:70px;margin-top:6px"></textarea>
-
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
-          <button class="btn" name="outcome" value="talked">Talked / Replied</button>
-          <button class="btn" name="outcome" value="no_answer">No answer</button>
-          <button class="btn" name="outcome" value="not_interested">Not interested</button>
-          <button class="btn" name="outcome" value="booked">Booked (verbal yes)</button>
-        </div>
-      </form>
+   <div class="item">
+  <div class="top">
+    <div class="name">
+      <a href="/leads/{a.lead_id}">#{a.lead_id} {name}</a>
     </div>
-    """
+    <div class="tag">{a.type}</div>
+  </div>
+
+  <div class="muted"><b>DO THIS:</b> {todo}</div>
+  <div class="muted">Reason: {reason or "-"}</div>
+  {msg_html}
+
+  <form method="post" action="/agenda/report" style="margin-top:10px">
+    <input type="hidden" name="action_id" value="{a.id}" />
+
+    <textarea
+      name="note"
+      placeholder="Paste what they said or dictate quick notes (AI decides next step)"
+      style="width:100%;min-height:70px;margin-top:6px"
+    ></textarea>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+      <button class="btn" type="submit" name="outcome" value="talked">
+        Talked / Replied
+      </button>
+      <button class="btn" type="submit" name="outcome" value="no_answer">
+        No answer
+      </button>
+      <button class="btn" type="submit" name="outcome" value="not_interested">
+        Not interested
+      </button>
+      <button class="btn" type="submit" name="outcome" value="booked">
+        Booked (verbal yes)
+      </button>
+    </div>
+  </form>
+</div>
 
 # =========================
 # Planner (creates PENDING actions)
