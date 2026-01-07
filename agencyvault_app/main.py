@@ -259,7 +259,29 @@ def extract_text_from_image_bytes(data: bytes) -> str:
 # =========================
 def normalize_to_leads(data):
     """
-    Accepts:
+    # Vendor-specific positional CSV (your exact format)
+elif isinstance(row, (list, tuple)) and len(row) >= 8:
+    first = row[0].strip()
+    last = row[1].strip()
+    cov_type = row[2].strip()        # IUL
+    tier = row[3].strip()            # GOAT
+    phone = row[4].strip()
+    dob = row[6].strip()
+    email = row[7].strip()
+    st = row[8].strip() if len(row) > 8 else None
+
+    leads.append({
+        "full_name": f"{first} {last}".strip(),
+        "phone": phone,
+        "email": email,
+        "state": st,
+        "birthdate": dob,
+        "coverage_type": cov_type,
+        "tier": tier,
+        "lead_source": "csv_vendor",
+    })
+    continue
+Accepts:
       - list[dict]  (CSV with headers)
       - list[list]  (CSV without headers)
       - raw text    (PDF / OCR)
