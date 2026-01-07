@@ -1888,7 +1888,7 @@ def twilio_recording(
         return {"ok": True}
     finally:
         db.close()
-@app.post("/test/twilio/text")
+@app.get("/test/twilio/text")
 def test_twilio_text():
     db = SessionLocal()
     try:
