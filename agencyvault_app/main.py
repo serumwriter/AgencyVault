@@ -3,7 +3,7 @@ import io
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -11,18 +11,48 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from zoneinfo import ZoneInfo
 
 from .database import engine, SessionLocal
 from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message
-from .image_import import extract_text_from_image_bytes, extract_text_from_pdf_bytes, normalize_to_leads
-from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
-from .twilio_client import send_alert_sms, send_lead_sms, make_call
+
+# Optional Google imports (if you already have google_drive_import.py)
+try:
+    from .google_drive_import import import_google_sheet, import_drive_csv, import_google_doc_text
+    GOOGLE_IMPORTS_OK = True
+except Exception:
+    GOOGLE_IMPORTS_OK = False
+
+# Twilio functions (handle multiple possible names)
+from .twilio_client import send_alert_sms, send_lead_sms
+
+try:
+    from .twilio_client import make_call_with_recording as _make_call
+except Exception:
+    try:
+        from .twilio_client import make_call as _make_call
+    except Exception:
+        _make_call = None
+
+
+# Optional PDF extraction
+try:
+    from pypdf import PdfReader
+    PDF_OK = True
+except Exception:
+    PDF_OK = False
+
+# Optional OCR
+try:
+    from PIL import Image
+    import pytesseract
+    OCR_OK = True
+except Exception:
+    OCR_OK = False
+
 
 app = FastAPI(title="AgencyVault - Command Center")
+
 
 # =========================
 # Startup / Schema
@@ -31,10 +61,13 @@ app = FastAPI(title="AgencyVault - Command Center")
 def _startup():
     Base.metadata.create_all(bind=engine)
 
+
 # =========================
-# Strict sanitization / normalization
+# Normalization / Sanitization
 # =========================
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_US_STATE_RE = re.compile(r"^(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)$", re.I)
+
 BAD_NAME_WORDS = {
     "lead", "bronze", "silver", "gold", "ethos",
     "facebook", "insurance", "prospect", "unknown", "test",
@@ -44,29 +77,41 @@ BAD_NAME_WORDS = {
 def _now() -> datetime:
     return datetime.utcnow()
 
-def clean_text(val):
+def clean_text(val: Any) -> Optional[str]:
     if val is None:
         return None
-    return CONTROL_RE.sub("", str(val)).replace("\x00", "").strip() or None
+    s = _CONTROL_RE.sub("", str(val)).replace("\x00", "").strip()
+    return s or None
 
-def normalize_phone(val) -> Optional[str]:
-    val = clean_text(val) or ""
-    d = re.sub(r"\D", "", val)
-    if len(d) == 10:
-        return "+1" + d
-    if len(d) == 11 and d.startswith("1"):
-        return "+" + d
-    if len(d) >= 12 and (val.startswith("+") or (val.startswith("00") and len(d) >= 12)):
-        return "+" + d
+def normalize_phone(val: Any) -> Optional[str]:
+    s = clean_text(val) or ""
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    if s.startswith("+") and len(digits) >= 11:
+        return "+" + digits
     return None
 
-def safe_first_name(full_name: str) -> str:
+def safe_first_name(full_name: Optional[str]) -> str:
     if not full_name:
         return ""
-    first = full_name.strip().split()[0].lower()
-    if first in BAD_NAME_WORDS or len(first) < 2 or any(c.isdigit() for c in first):
+    first = (full_name.strip().split() or [""])[0].strip().lower()
+    if not first or first in BAD_NAME_WORDS or len(first) < 2:
+        return ""
+    if any(c.isdigit() for c in first):
         return ""
     return first.capitalize()
+
+def normalize_state(val: Any) -> Optional[str]:
+    s = (clean_text(val) or "").strip()
+    if not s:
+        return None
+    s2 = s.upper()
+    if _US_STATE_RE.match(s2):
+        return s2
+    return None
 
 def dedupe_exists(db: Session, phone: Optional[str], email: Optional[str]) -> bool:
     if phone and db.query(Lead).filter(Lead.phone == phone).first():
@@ -96,23 +141,283 @@ def mem_get(db: Session, lead_id: int, key: str) -> Optional[str]:
     row = db.query(LeadMemory).filter_by(lead_id=lead_id, key=key).first()
     return row.value if row else None
 
+def require_admin(req: Request, token_from_form: str = "") -> bool:
+    token = (token_from_form or req.headers.get("x-admin-token", "") or req.query_params.get("token", "") or "").strip()
+    want = (os.getenv("ADMIN_TOKEN") or "").strip()
+    if not want:
+        return False
+    return token == want
+
+
+# =========================
+# Timezone inference (simple + safe)
+# =========================
+def infer_timezone_from_phone(phone_e164: Optional[str]) -> Optional[str]:
+    """
+    Conservative:
+    - If unknown, default to America/Denver (your timezone) instead of blocking outreach.
+    - You can upgrade later with a real libphonenumber mapping.
+    """
+    if not phone_e164:
+        return "America/Denver"
+    # If it is +1 US/CA, assume your timezone for now.
+    # Upgrade later: parse area code mapping.
+    return (os.getenv("DEFAULT_TIMEZONE") or "America/Denver").strip()
+
+def allowed_to_contact(lead: Lead) -> bool:
+    tz_name = (lead.timezone or "").strip()
+    if not tz_name:
+        tz_name = (os.getenv("DEFAULT_TIMEZONE") or "America/Denver").strip()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("America/Denver")
+    local_hour = datetime.now(tz).hour
+    return 8 <= local_hour < 21
+
+
+# =========================
+# Owner escalation + forwarding rules
+# =========================
+def owner_mobile() -> str:
+    return (os.getenv("OWNER_MOBILE") or os.getenv("TWILIO_OWNER_NUMBER") or os.getenv("TWILIO_TO_NUMBER") or "").strip()
+
+def notify_owner(db: Session, lead: Optional[Lead], msg: str, tag: str = "OWNER_NOTIFY"):
+    try:
+        who = ""
+        if lead:
+            who = f"#{lead.id} {lead.full_name or 'Unknown'} {lead.phone or ''}".strip()
+        payload = f"{tag}\n{who}\n\n{(msg or '').strip()}".strip()
+        _log(db, lead.id if lead else None, None, tag, payload[:5000])
+        db.commit()
+    except Exception:
+        pass
+
+    try:
+        if owner_mobile():
+            send_alert_sms(payload)
+    except Exception as e:
+        try:
+            _log(db, lead.id if lead else None, None, "OWNER_NOTIFY_FAILED", str(e)[:2000])
+            db.commit()
+        except Exception:
+            pass
+
 def cancel_pending_actions(db: Session, lead_id: int, reason: str):
-    q = db.query(Action).filter(Action.lead_id == lead_id, Action.status == "PENDING").all()
-    for a in q:
+    actions = db.query(Action).filter(Action.lead_id == lead_id, Action.status == "PENDING").all()
+    for a in actions:
         a.status = "SKIPPED"
         a.error = f"Canceled: {reason}"
         a.finished_at = _now()
     _log(db, lead_id, None, "ACTIONS_CANCELED", reason)
 
-def require_admin(req: Request) -> bool:
-    token = req.headers.get("x-admin-token", "") or req.query_params.get("token", "")
-    want = (os.getenv("ADMIN_TOKEN") or "").strip()
-    if not want:
-        return False
-    return token.strip() == want
+def classify_inbound_text(body: str) -> str:
+    t = (body or "").strip().lower()
+    if any(x in t for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
+        return "STOP"
+    if any(x in t for x in ["appointment", "appt", "schedule", "book", "tomorrow", "today", "am", "pm", "morning", "afternoon", "evening"]):
+        return "APPT"
+    if any(x in t for x in ["call me", "ready", "yes", "yep", "yeah", "now", "interested"]):
+        return "HOT"
+    if any(x in t for x in ["how much", "price", "cost", "quote", "coverage", "premium", "whole life", "term", "monthly"]):
+        return "QUESTION"
+    return "NEUTRAL"
+
 
 # =========================
-# Health / Root
+# PDF / OCR Extraction
+# =========================
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    if not PDF_OK:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        chunks: List[str] = []
+        for page in reader.pages:
+            try:
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    chunks.append(txt)
+            except Exception:
+                continue
+        return "\n".join(chunks)
+    except Exception:
+        return ""
+
+def extract_text_from_image_bytes(data: bytes) -> str:
+    if not OCR_OK:
+        return ""
+    try:
+        img = Image.open(io.BytesIO(data))
+        return pytesseract.image_to_string(img) or ""
+    except Exception:
+        return ""
+
+
+# =========================
+# Lead normalization (CSV + Text blocks)
+# =========================
+def normalize_to_leads(data: Any) -> List[Dict[str, Any]]:
+    """
+    Accepts:
+      - list[dict] (CSV rows)
+      - raw text string (PDF/image/doc extraction)
+    Returns list of normalized lead dicts.
+    """
+    leads: List[Dict[str, Any]] = []
+
+    # CSV rows
+    if isinstance(data, list):
+        for row in data:
+            clean = {}
+            for k, v in (row or {}).items():
+                if not k:
+                    continue
+                kk = str(k).strip().lower()
+                vv = v.strip() if isinstance(v, str) else v
+                clean[kk] = vv
+
+            first = clean.get("first name") or clean.get("firstname") or clean.get("first")
+            last = clean.get("last name") or clean.get("lastname") or clean.get("last")
+            full_name = clean.get("full name") or clean.get("name")
+            if not full_name:
+                full_name = f"{first or ''} {last or ''}".strip() or None
+
+            phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell") or clean.get("cell phone")
+            email = clean.get("email")
+            st = clean.get("state") or clean.get("st")
+            dob = clean.get("dob") or clean.get("date of birth") or clean.get("birthdate")
+            cov = clean.get("coverage") or clean.get("coverage amount") or clean.get("desired coverage") or clean.get("desired coverage amount")
+            cov_type = clean.get("coverage type") or clean.get("policy type") or clean.get("type")
+            source = clean.get("source") or clean.get("lead source")
+            ref = clean.get("lead id") or clean.get("reference") or clean.get("inquiry id") or clean.get("id")
+
+            leads.append({
+                "full_name": full_name,
+                "phone": phone,
+                "email": email,
+                "state": st,
+                "birthdate": dob,
+                "coverage_requested": cov,
+                "coverage_type": cov_type,
+                "lead_source": source,
+                "lead_reference": ref,
+            })
+        return leads
+
+    # Text parse (PDF / OCR / Doc)
+    raw = (data or "")
+    if not isinstance(raw, str):
+        raw = str(raw)
+
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    buf: Dict[str, Any] = {}
+
+    phone_re = re.compile(r"(\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})")
+    email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+    def flush():
+        nonlocal buf
+        if buf.get("phone") or buf.get("email"):
+            leads.append(buf)
+        buf = {}
+
+    for line in lines:
+        low = line.lower()
+
+        # Split by common "Label: value" formats
+        if ":" in line:
+            left, right = line.split(":", 1)
+            key = left.strip().lower()
+            val = right.strip()
+
+            if key in ["name", "full name"]:
+                buf["full_name"] = val
+            elif key in ["phone", "phone number", "mobile", "cell"]:
+                buf["phone"] = val
+            elif key in ["email"]:
+                buf["email"] = val
+            elif key in ["state", "st"]:
+                buf["state"] = val
+            elif key in ["dob", "date of birth", "birthdate"]:
+                buf["birthdate"] = val
+            elif "coverage" in key:
+                buf["coverage_requested"] = val
+            elif "type" in key:
+                buf["coverage_type"] = val
+            elif key in ["inquiry id", "lead id", "reference", "ref"]:
+                buf["lead_reference"] = val
+                flush()
+            else:
+                # ignore unknown keys
+                pass
+            continue
+
+        # Otherwise pattern match
+        m1 = phone_re.search(line)
+        if m1:
+            buf["phone"] = m1.group(1)
+
+        m2 = email_re.search(line)
+        if m2:
+            buf["email"] = m2.group(0)
+
+        # Detect likely name line (first non-empty, no digits)
+        if "full_name" not in buf and len(line.split()) >= 2 and not any(c.isdigit() for c in line):
+            # conservative: only if it's shortish
+            if len(line) <= 40:
+                buf["full_name"] = line
+
+        # If we have enough to consider it a lead, and we hit a blank-ish separator next, flush
+        if (buf.get("phone") or buf.get("email")) and ("---" in line or "====" in line):
+            flush()
+
+    flush()
+    return leads
+
+
+# =========================
+# DB Insert helper (THIS is what your imports use)
+# =========================
+def _import_row(db: Session, row: Dict[str, Any]) -> bool:
+    phone = normalize_phone(row.get("phone"))
+    email = clean_text(row.get("email"))
+    name = clean_text(row.get("full_name")) or "Unknown"
+
+    if not phone:
+        return False
+
+    if dedupe_exists(db, phone, email):
+        return False
+
+    tz = infer_timezone_from_phone(phone)
+    st = normalize_state(row.get("state"))
+    birth = clean_text(row.get("birthdate"))
+    cov = clean_text(row.get("coverage_requested"))
+    cov_type = clean_text(row.get("coverage_type"))
+    src = clean_text(row.get("lead_source"))
+    ref = clean_text(row.get("lead_reference"))
+
+    lead = Lead(
+        full_name=name,
+        phone=phone,
+        email=email,
+        state="NEW",                 # workflow state, not US state
+        timezone=tz,
+        us_state=st,                 # IMPORTANT: separate column (your models should have it; if not, we can switch to LeadMemory)
+        birthdate=birth,
+        coverage_requested=cov,
+        coverage_type=cov_type,
+        lead_source=src,
+        lead_reference=ref,
+        created_at=_now(),
+        updated_at=_now(),
+    )
+
+    db.add(lead)
+    return True
+# =========================
+# Health / Root / Service worker
 # =========================
 @app.get("/health")
 def health():
@@ -124,70 +429,29 @@ def health():
 def root():
     return RedirectResponse("/dashboard")
 
-# =========================
-# Reduce noisy 404 logs from PWA attempts
-# =========================
 @app.get("/sw.js")
 def sw():
-    return Response(content="/* no-op service worker for AgencyVault */", media_type="application/javascript")
+    return Response(content="/* no-op service worker */", media_type="application/javascript")
+
 
 # =========================
-# Google Drive helpers (ENV creds default)
-# =========================
-SCOPES = [
-    "https://www.googleapis.com/auth/drive.readonly",
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-]
-
-def _load_google_service_account(creds_json_optional: Optional[str] = None) -> Dict[str, Any]:
-    raw = (creds_json_optional or "").strip()
-    if not raw:
-        raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-
-    if not raw:
-        raise ValueError("Missing Google credentials. Set GOOGLE_SERVICE_ACCOUNT_JSON in Render Environment.")
-    try:
-        return json.loads(raw)
-    except Exception:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON (or pasted creds_json is invalid).")
-
-def _drive_creds(service_account_info: dict) -> Credentials:
-    return Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
-
-def drive_download_bytes(service_account_info: dict, file_id: str) -> bytes:
-    creds = _drive_creds(service_account_info)
-    service = build("drive", "v3", credentials=creds)
-    request = service.files().get_media(fileId=file_id)
-
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    buf.seek(0)
-    return buf.read()
-
-# =========================
-# AI Chat (server-side) with offline fallback
+# AI chat (server-side) with offline fallback
 # =========================
 async def llm_reply(user_text: str, context: str = "") -> str:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
-        return (
-            "AI is OFF (OPENAI_API_KEY missing). "
-            "I can still run built-in commands like: counts | show pending | show newest | lead 123"
-        )
+        return "AI is OFF (OPENAI_API_KEY missing). Use: counts | show pending | show newest | run planner | lead 123"
 
     model = (os.getenv("OPENAI_MODEL") or "gpt-5").strip()
 
     system = (
-        "You are AgencyVault AI Employee for a life insurance agency. "
-        "Be direct, practical, and sales-focused. "
-        "Never invent database values. If unsure, say what you can check next. "
-        "If the user asks to call/text, explain what buttons/steps to use in the app."
+        "You are AgencyVault AI Employee for a life insurance agency.\n"
+        "Be direct and practical.\n"
+        "Never invent database values.\n"
+        "If lead replied with a question, recommend that Nick calls personally.\n"
     )
     if context:
-        system += "\n\nLive context:\n" + context
+        system += "\nLive context:\n" + context
 
     payload = {
         "model": model,
@@ -204,8 +468,7 @@ async def llm_reply(user_text: str, context: str = "") -> str:
             json=payload,
         )
         if r.status_code >= 400:
-            txt = (r.text or "")[:600]
-            return f"AI error ({r.status_code}). If this says quota/429, add billing.\n\nRaw:\n{txt}"
+            return f"AI error {r.status_code}: {(r.text or '')[:400]}"
 
         data = r.json()
 
@@ -224,21 +487,7 @@ async def llm_reply(user_text: str, context: str = "") -> str:
 def offline_assistant(db: Session, msg: str) -> str:
     low = (msg or "").strip().lower()
     if not low:
-        return "Type: counts | show pending | show newest | help"
-
-    if "help" in low:
-        return (
-            "Offline commands:\n"
-            "- counts\n"
-            "- show pending\n"
-            "- show newest\n"
-            "- lead <id>\n"
-            "- pause status\n"
-        )
-
-    if "pause" in low and "status" in low:
-        paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
-        return f"GLOBAL_PAUSE is {'ON (paused)' if paused else 'OFF (running)'}."
+        return "Type: counts | show pending | show newest | run planner | lead 123"
 
     if "counts" in low:
         total = db.query(Lead).count()
@@ -267,15 +516,13 @@ def offline_assistant(db: Session, msg: str) -> str:
         )
         if not actions:
             return "No pending actions."
-        lines = [f"- Action#{a.id} {a.type} lead={a.lead_id} created={a.created_at}" for a in actions]
-        return "Pending actions:\n" + "\n".join(lines)
+        return "Pending actions:\n" + "\n".join([f"- #{a.id} {a.type} lead={a.lead_id} created={a.created_at}" for a in actions])
 
     if "show" in low and ("newest" in low or "recent" in low):
         leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(15).all()
         if not leads:
             return "No leads found."
-        lines = [f"- #{l.id} {l.full_name} {l.phone} [{l.state}]" for l in leads]
-        return "Newest leads:\n" + "\n".join(lines)
+        return "Newest leads:\n" + "\n".join([f"- #{l.id} {l.full_name} {l.phone} [{l.state}]" for l in leads])
 
     if low.startswith("lead "):
         nums = re.findall(r"\d+", low)
@@ -290,26 +537,31 @@ def offline_assistant(db: Session, msg: str) -> str:
             f"Name: {lead.full_name}\n"
             f"Phone: {lead.phone}\n"
             f"Email: {lead.email or '-'}\n"
-            f"State: {lead.state}\n"
-            f"Last contacted: {lead.last_contacted_at or '-'}"
+            f"Workflow: {lead.state}\n"
+            f"US State: {getattr(lead, 'us_state', None) or '-'}\n"
+            f"Timezone: {lead.timezone or '-'}\n"
+            f"Coverage: {getattr(lead, 'coverage_requested', None) or '-'}\n"
         )
 
-    return "Try: counts | show pending | show newest | lead <id> | help"
+    if "run" in low and "planner" in low:
+        out = plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
+        return json.dumps(out, indent=2)
+
+    return "Try: counts | show pending | show newest | run planner | lead 123"
+
 
 # =========================
-# AI Planner (creates actions) + GLOBAL PAUSE
+# Planner (creates PENDING actions)
+# IMPORTANT: payload_json uses keys your worker can execute:
+#   TEXT -> {"to": "...", "message": "..."}
+#   CALL -> {"to": "...", "lead_id": 123}
 # =========================
 def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
     paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
     if paused:
         return {"ok": False, "paused": True, "message": "AI work is PAUSED by operator."}
 
-    run = AgentRun(
-        mode="planning",
-        status="STARTED",
-        batch_size=batch_size,
-        notes="Auto planner run",
-    )
+    run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="Planner run")
     db.add(run)
     db.flush()
 
@@ -319,10 +571,7 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     leads = (
         db.query(Lead)
-        .filter(
-            Lead.state == "NEW",
-            Lead.phone.isnot(None),
-        )
+        .filter(Lead.state == "NEW", Lead.phone.isnot(None))
         .order_by(Lead.created_at.asc())
         .limit(batch_size)
         .all()
@@ -330,10 +579,14 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
 
     for lead in leads:
         considered += 1
+
+        # Ensure timezone exists
+        if not (lead.timezone or "").strip():
+            lead.timezone = infer_timezone_from_phone(lead.phone)
+
         first = safe_first_name(lead.full_name)
 
-        # -------- TEXT ACTION --------
-        text_msg = (
+        msg1 = (
             f"Hi{(' ' + first) if first else ''}, this is Nick's office. "
             "You requested life insurance information. "
             "Would you like a quick quote today?"
@@ -345,28 +598,29 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
             status="PENDING",
             tool="twilio",
             payload_json=json.dumps({
-                "message": text_msg
+                "to": lead.phone,
+                "message": msg1
             }),
             created_at=nowv,
         ))
         planned += 1
 
-        # -------- CALL ACTION (15 min later) --------
+        # Optional call follow-up (15 min later)
         call_due = (nowv + timedelta(minutes=15)).isoformat()
-
         db.add(Action(
             lead_id=lead.id,
             type="CALL",
             status="PENDING",
             tool="twilio",
             payload_json=json.dumps({
+                "to": lead.phone,
+                "lead_id": lead.id,
                 "due_at": call_due
             }),
             created_at=nowv,
         ))
         planned += 1
 
-        # Update lead state
         lead.state = "WORKING"
         lead.updated_at = nowv
 
@@ -374,21 +628,10 @@ def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
     run.finished_at = _now()
     db.commit()
 
-    _log(
-        db,
-        None,
-        run.id,
-        "AI_PLANNED",
-        f"planned={planned} considered={considered}",
-    )
+    _log(db, None, run.id, "AI_PLANNED", f"planned={planned} considered={considered}")
     db.commit()
 
-    return {
-        "ok": True,
-        "run_id": run.id,
-        "planned_actions": planned,
-        "considered": considered,
-    }
+    return {"ok": True, "run_id": run.id, "planned_actions": planned, "considered": considered}
 
 
 @app.get("/ai/plan")
@@ -398,6 +641,7 @@ def ai_plan():
         return plan_actions(db, batch_size=int(os.getenv("AI_BATCH_SIZE", "25")))
     finally:
         db.close()
+
 
 # =========================
 # Assistant API
@@ -411,7 +655,7 @@ async def assistant_api(payload: dict):
         db.commit()
 
         if not msg:
-            return {"reply": "Try: counts | show pending | show newest | lead 123 | run planner"}
+            return {"reply": "Try: counts | show pending | show newest | run planner | lead 123"}
 
         low = msg.lower()
         if "run" in low and "planner" in low:
@@ -455,6 +699,7 @@ async def assistant_api(payload: dict):
     finally:
         db.close()
 
+
 # =========================
 # Dashboard helpers
 # =========================
@@ -482,8 +727,9 @@ def _svg_donut(pct: float) -> str:
     </svg>
     """
 
+
 # =========================
-# Dashboard (Command Center)
+# Dashboard
 # =========================
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -514,11 +760,14 @@ def dashboard():
         leads = db.query(Lead).order_by(Lead.created_at.desc()).limit(10).all()
         leads_html = ""
         for l in leads:
+            us_state = getattr(l, "us_state", None) or "-"
+            cov = getattr(l, "coverage_requested", None) or "-"
             leads_html += f"""
             <div class="lead-row">
               <div>
                 <div class="lead-name"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a></div>
                 <div class="lead-meta">{l.phone or "-"} | {l.email or "-"}</div>
+                <div class="lead-meta">US State: {us_state} | Coverage: {cov}</div>
               </div>
               <div class="lead-badges">
                 <span class="pill">{l.state}</span>
@@ -638,10 +887,9 @@ def dashboard():
       <a href="/leads/new">Add Lead<small>Manual entry</small></a>
       <a href="/imports">Imports<small>CSV, Google, Images, PDF</small></a>
       <a href="/actions">Action Queue<small>Calls/texts planned</small></a>
-      <a href="/activity">Activity Log<small>What AI did</small></a>
+      <a href="/activity">Activity Log<small>What happened</small></a>
       <a href="/admin">Admin<small>Mass delete and pause</small></a>
-      <a href="/uploads">Upload Leads</a>
-      <a href="/ai/plan">Run Planner<small>Create outreach actions</small></a>
+      <a href="/ai/plan">Run Planner<small>Create PENDING actions</small></a>
     </div>
 
     <div style="margin-top:14px" class="muted">
@@ -653,7 +901,7 @@ def dashboard():
     <div class="topbar">
       <div>
         <div class="title">Command Center</div>
-        <div class="subtitle">Everything important is visible right here - no hunting through menus.</div>
+        <div class="subtitle">Everything important is visible right here.</div>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <a class="btn" href="/leads/new">Add Lead</a>
@@ -695,16 +943,7 @@ def dashboard():
       <div class="panel">
         <h2>Schedule</h2>
         <div class="muted" style="margin-bottom:10px;">
-          If you want a real Google Calendar embed, set <b>GOOGLE_CALENDAR_EMBED_URL</b> in Render.
-        </div>
-        <div style="background:rgba(11,15,23,.6); border:1px solid var(--border); border-radius:14px; padding:12px;">
-          <iframe
-            src="{(os.getenv('GOOGLE_CALENDAR_EMBED_URL') or '').strip()}"
-            style="width:100%;height:320px;border:0;border-radius:12px;background:rgba(11,15,23,.35);"
-          ></iframe>
-          <div class="muted" style="margin-top:8px;">
-            If the iframe is blank, you have not set GOOGLE_CALENDAR_EMBED_URL yet.
-          </div>
+          Calendar sync will be added after imports + texting is confirmed stable.
         </div>
       </div>
     </div>
@@ -713,7 +952,7 @@ def dashboard():
   <aside class="right">
     <div class="panel" style="padding:14px;">
       <h2>AI Employee</h2>
-      <div class="muted">If OpenAI quota is out, it auto-switches to Offline Assistant.</div>
+      <div class="muted">If OpenAI is off, it uses Offline Assistant.</div>
       <textarea id="cmd" placeholder="Try: counts | show pending | show newest | lead 12 | run planner"></textarea>
       <div style="display:flex; gap:10px; margin-top:10px;">
         <button class="btn" onclick="send()">Send</button>
@@ -721,18 +960,6 @@ def dashboard():
         <button class="btn" onclick="document.getElementById('cmd').value='run planner'; send();">Run Planner</button>
       </div>
       <pre id="out" class="muted"></pre>
-    </div>
-
-    <div class="panel" style="margin-top:12px;">
-      <h2>Work Control</h2>
-      <div class="muted" style="margin-bottom:8px;">Pause/resume planner + worker behavior (admin token required).</div>
-      <form method="post" action="/admin/pause-toggle">
-        <input name="token" placeholder="ADMIN_TOKEN" />
-        <div style="margin-top:8px;">
-          <button class="btn" type="submit">{pause_label}</button>
-        </div>
-      </form>
-      <div class="muted" style="margin-top:8px;">Current: <b>{pause_sub}</b></div>
     </div>
 
     <div class="panel" style="margin-top:12px;">
@@ -755,37 +982,6 @@ def dashboard():
         <input type="file" name="file" accept=".pdf,application/pdf" />
         <div style="margin-top:8px;"><button class="btn" type="submit">Upload PDF</button></div>
       </form>
-
-      <hr style="border:none;border-top:1px solid var(--border);margin:16px 0;"/>
-
-      <div class="muted">Google Sheet (uses env creds automatically)</div>
-      <form action="/import/google-sheet" method="post">
-        <div style="margin-top:8px;"><input name="spreadsheet_id" placeholder="Spreadsheet ID" /></div>
-        <div style="margin-top:8px;"><input name="range_name" placeholder="Range (ex: Sheet1!A1:Z)" /></div>
-        <div style="margin-top:8px;"><button class="btn" type="submit">Import Sheet</button></div>
-      </form>
-
-      <div class="muted" style="margin-top:14px;">Google Drive CSV (env creds)</div>
-      <form action="/import/drive-csv" method="post">
-        <div style="margin-top:8px;"><input name="file_id" placeholder="Drive File ID (CSV)" /></div>
-        <div style="margin-top:8px;"><button class="btn" type="submit">Import Drive CSV</button></div>
-      </form>
-
-      <div class="muted" style="margin-top:14px;">Google Doc (env creds)</div>
-      <form action="/import/google-doc" method="post">
-        <div style="margin-top:8px;"><input name="file_id" placeholder="Doc File ID" /></div>
-        <div style="margin-top:8px;"><button class="btn" type="submit">Import Doc</button></div>
-      </form>
-
-      <div class="muted" style="margin-top:14px;">Google Drive Image (env creds)</div>
-      <form action="/import/drive-image" method="post">
-        <div style="margin-top:8px;"><input name="file_id" placeholder="Drive Image File ID (JPG/PNG)" /></div>
-        <div style="margin-top:8px;"><button class="btn" type="submit">Import Drive Image</button></div>
-      </form>
-
-      <div class="muted" style="margin-top:12px;">
-        If Google imports fail: set <b>GOOGLE_SERVICE_ACCOUNT_JSON</b> in Render.
-      </div>
     </div>
 
   </aside>
@@ -812,74 +1008,76 @@ async function send() {{
 </script>
 </body>
 </html>
-""")
+        """)
     finally:
         db.close()
 
-# =========================
-# Imports page (sidebar link)
-# =========================
+
 @app.get("/imports", response_class=HTMLResponse)
 def imports_page():
     return RedirectResponse("/dashboard#imports", status_code=303)
 
+
 # =========================
-# Import helpers
+# Imports (ONE route each - no duplicates)
 # =========================
 @app.post("/import/csv")
 async def import_csv(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
-        raw = (await file.read()).decode("utf-8", errors="ignore")
+        raw_bytes = await file.read()
+        if not raw_bytes:
+            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
 
+        raw = raw_bytes.decode("utf-8", errors="ignore")
         reader = csv.DictReader(io.StringIO(raw))
         rows = list(reader)
 
-        print("CSV ROW COUNT:", len(rows))
-        print("CSV HEADERS:", rows[0].keys() if rows else "NO ROWS")
-
         leads = normalize_to_leads(rows)
-
-        print("NORMALIZED LEADS COUNT:", len(leads))
-        print("NORMALIZED SAMPLE:", leads[:2])
 
         added = 0
         for lead in leads:
             if _import_row(db, lead):
                 added += 1
 
+        _log(db, None, None, "IMPORT_CSV", f"rows={len(rows)} leads={len(leads)} imported={added}")
         db.commit()
-        print("IMPORTED:", added)
-
         return RedirectResponse("/dashboard", status_code=303)
-
+    except Exception as e:
+        _log(db, None, None, "IMPORT_CSV_ERROR", str(e)[:2000])
+        db.commit()
+        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>CSV Import Error: {str(e)[:500]}</div>", status_code=400)
     finally:
         db.close()
 
-# =========================
-# Imports (CSV / Image / PDF / Google / Drive)
-# =========================
-@app.post("/import/csv")
-async def import_csv(file: UploadFile = File(...)):
+
+@app.post("/import/pdf")
+async def import_pdf(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
-        raw = (await file.read()).decode("utf-8", errors="ignore")
+        data = await file.read()
+        if not data:
+            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
 
-        reader = csv.DictReader(io.StringIO(raw))
-        rows = list(reader)
+        text_data = extract_text_from_pdf_bytes(data)
+        if not (text_data or "").strip():
+            _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable PDF text")
+            db.commit()
+            return RedirectResponse("/dashboard", status_code=303)
 
-        leads = normalize_to_leads(rows)
-
+        leads = normalize_to_leads(text_data)
         added = 0
         for lead in leads:
             if _import_row(db, lead):
                 added += 1
 
-        _log(db, None, None, "IMPORT_CSV", f"imported={added}")
+        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
         db.commit()
-
         return RedirectResponse("/dashboard", status_code=303)
-
+    except Exception as e:
+        _log(db, None, None, "IMPORT_PDF_ERROR", str(e)[:2000])
+        db.commit()
+        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>PDF Import Error: {str(e)[:500]}</div>", status_code=400)
     finally:
         db.close()
 
@@ -889,163 +1087,30 @@ async def import_image(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
         data = await file.read()
+        if not data:
+            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
+
         text_data = extract_text_from_image_bytes(data)
-        leads = normalize_to_leads(text)
-        added = 0
-        for l in leads:
-            if _import_row(db, l):
-                added += 1
-        _log(db, None, None, "IMPORT_IMAGE", f"imported={added}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
-@app.post("/import/pdf")
-async def import_pdf(file: UploadFile = File(...)):
-    db = SessionLocal()
-    try:
-        if not (file.filename or "").lower().endswith(".pdf"):
-            return JSONResponse({"error": "Only PDF files are allowed"}, status_code=400)
-
-        data = await file.read()
-        text_data = extract_text_from_pdf_bytes(data)
-
         if not (text_data or "").strip():
-            _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable text found")
+            _log(db, None, None, "IMPORT_IMAGE_EMPTY", "OCR not available or no text extracted")
             db.commit()
             return RedirectResponse("/dashboard", status_code=303)
 
-        from .image_import import normalize_insurance_text
-
-        leads = normalize_insurance_text(text_data)
+        leads = normalize_to_leads(text_data)
         added = 0
-        for l in leads:
-            if _import_row(db, l):
+        for lead in leads:
+            if _import_row(db, lead):
                 added += 1
 
-        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
+        _log(db, None, None, "IMPORT_IMAGE", f"imported={added}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
-@app.post("/import/google-sheet")
-def import_sheet(
-    spreadsheet_id: str = Form(...),
-    range_name: str = Form(...),
-    creds_json: str = Form("")
-):
-    db = SessionLocal()
-    try:
-        try:
-            creds = _load_google_service_account(creds_json)
-        except Exception as e:
-            _log(db, None, None, "IMPORT_SHEET_ERROR", str(e))
-            db.commit()
-            return HTMLResponse(
-                f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>",
-                status_code=400
-            )
-
-        rows = import_google_sheet(creds, spreadsheet_id, range_name)
-        added = 0
-        for row in rows:
-            if _import_row(db, row):
-                added += 1
-        _log(db, None, None, "IMPORT_SHEET", f"imported={added}")
+    except Exception as e:
+        _log(db, None, None, "IMPORT_IMAGE_ERROR", str(e)[:2000])
         db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
+        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Image Import Error: {str(e)[:500]}</div>", status_code=400)
     finally:
         db.close()
-
-@app.post("/import/drive-csv")
-def import_drive_csv_route(
-    file_id: str = Form(...),
-    creds_json: str = Form("")
-):
-    db = SessionLocal()
-    try:
-        try:
-            creds = _load_google_service_account(creds_json)
-        except Exception as e:
-            _log(db, None, None, "IMPORT_DRIVE_CSV_ERROR", str(e))
-            db.commit()
-            return HTMLResponse(
-                f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>",
-                status_code=400
-            )
-
-        rows = import_drive_csv(creds, file_id)
-        added = 0
-        for row in rows:
-            if _import_row(db, row):
-                added += 1
-        _log(db, None, None, "IMPORT_DRIVE_CSV", f"imported={added}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
-@app.post("/import/google-doc")
-def import_doc(
-    file_id: str = Form(...),
-    creds_json: str = Form("")
-):
-    db = SessionLocal()
-    try:
-        try:
-            creds = _load_google_service_account(creds_json)
-        except Exception as e:
-            _log(db, None, None, "IMPORT_GOOGLE_DOC_ERROR", str(e))
-            db.commit()
-            return HTMLResponse(
-                f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>",
-                status_code=400
-            )
-
-        text_data = import_google_doc_text(creds, file_id)
-        leads = normalize_to_leads(text)
-        added = 0
-        for l in leads:
-            if _import_row(db, l):
-                added += 1
-        _log(db, None, None, "IMPORT_GOOGLE_DOC", f"imported={added}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
-@app.post("/import/drive-image")
-def import_drive_image(
-    file_id: str = Form(...),
-    creds_json: str = Form("")
-):
-    db = SessionLocal()
-    try:
-        try:
-            creds = _load_google_service_account(creds_json)
-        except Exception as e:
-            _log(db, None, None, "IMPORT_DRIVE_IMAGE_ERROR", str(e))
-            db.commit()
-            return HTMLResponse(
-                f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>{e}</div>",
-                status_code=400
-            )
-
-        img_bytes = drive_download_bytes(creds, file_id)
-        text_data = extract_text_from_image_bytes(img_bytes)
-        leads = normalize_to_leads(text)
-        added = 0
-        for l in leads:
-            if _import_row(db, l):
-                added += 1
-        _log(db, None, None, "IMPORT_DRIVE_IMAGE", f"imported={added}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    finally:
-        db.close()
-
 # =========================
 # Leads: Add + List + Detail + Delete
 # =========================
@@ -1081,20 +1146,10 @@ def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = For
         n = clean_text(full_name) or "Unknown"
 
         if not p:
-            return HTMLResponse(
-                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>"
-                "Invalid phone. Use 10 digits like 4065551234."
-                "</div>",
-                status_code=400
-            )
+            return HTMLResponse("<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Invalid phone.</div>", status_code=400)
 
         if dedupe_exists(db, p, e):
-            return HTMLResponse(
-                "<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>"
-                "Lead already exists (duplicate phone/email)."
-                "</div>",
-                status_code=409
-            )
+            return HTMLResponse("<div style='color:#ffb4b4;font-family:system-ui;padding:20px'>Duplicate lead.</div>", status_code=409)
 
         tz = infer_timezone_from_phone(p)
 
@@ -1102,17 +1157,15 @@ def leads_new(full_name: str = Form(""), phone: str = Form(""), email: str = For
             full_name=n,
             phone=p,
             email=e,
-            state="NEW",          # workflow state
-            timezone=tz,          # derived from phone
+            state="NEW",
+            timezone=tz,
             created_at=_now(),
             updated_at=_now(),
         ))
 
         _log(db, None, None, "LEAD_CREATED", f"{n} {p}")
         db.commit()
-
         return RedirectResponse("/dashboard", status_code=303)
-
     finally:
         db.close()
 
@@ -1130,11 +1183,14 @@ def leads_list(search: str = "", state: str = ""):
 
         rows = ""
         for l in leads:
+            us_state = getattr(l, "us_state", None) or "-"
+            cov = getattr(l, "coverage_requested", None) or "-"
             rows += f"""
             <div style="padding:12px 0;border-bottom:1px solid rgba(50,74,110,.25);display:flex;justify-content:space-between;gap:12px;align-items:center;">
               <div>
                 <div style="font-weight:900;"><a href="/leads/{l.id}">#{l.id} {l.full_name or "Unknown"}</a> <span style="opacity:.75;font-weight:700;">[{l.state}]</span></div>
                 <div style="opacity:.75;font-size:13px;margin-top:2px;">Phone: {l.phone or "-"} | Email: {l.email or "-"}</div>
+                <div style="opacity:.75;font-size:13px;margin-top:2px;">US State: {us_state} | Coverage: {cov}</div>
               </div>
               <div style="display:flex;gap:10px;align-items:center;">
                 <a href="/leads/{l.id}" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:8px 12px;border-radius:12px;text-decoration:none;font-weight:800;">Open</a>
@@ -1156,11 +1212,11 @@ def leads_list(search: str = "", state: str = ""):
             <input name="search" value="{(search or '').replace('"','&quot;')}" placeholder="Search name/phone/email"
                    style="flex:1;min-width:240px;padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3" />
             <select name="state" style="padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0f1624;color:#e6edf3">
-              <option value="">All states</option>
+              <option value="">All workflow states</option>
               <option value="NEW" {"selected" if state=="NEW" else ""}>NEW</option>
               <option value="WORKING" {"selected" if state=="WORKING" else ""}>WORKING</option>
               <option value="CONTACTED" {"selected" if state=="CONTACTED" else ""}>CONTACTED</option>
-              <option value="CLOSED" {"selected" if state=="CLOSED" else ""}>CLOSED</option>
+              <option value="APPT_PENDING" {"selected" if state=="APPT_PENDING" else ""}>APPT_PENDING</option>
               <option value="DO_NOT_CONTACT" {"selected" if state=="DO_NOT_CONTACT" else ""}>DO_NOT_CONTACT</option>
             </select>
             <button type="submit" style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
@@ -1232,6 +1288,11 @@ def lead_detail(lead_id: int):
             """ for l in logs
         ) or "<div style='opacity:.65'>No activity</div>"
 
+        us_state = getattr(lead, "us_state", None) or "-"
+        cov = getattr(lead, "coverage_requested", None) or "-"
+        cov_type = getattr(lead, "coverage_type", None) or "-"
+        tz = lead.timezone or "-"
+
         return HTMLResponse(f"""
 <!doctype html>
 <html>
@@ -1246,8 +1307,11 @@ def lead_detail(lead_id: int):
 <div style="display:flex;gap:18px;flex-wrap:wrap;opacity:.92">
   <div>Phone: <b>{lead.phone or "-"}</b></div>
   <div>Email: <b>{lead.email or "-"}</b></div>
-  <div>Status: <b>{lead.state}</b></div>
-  <div>Last: <b>{lead.last_contacted_at or "-"}</b></div>
+  <div>Workflow: <b>{lead.state}</b></div>
+  <div>US State: <b>{us_state}</b></div>
+  <div>Timezone: <b>{tz}</b></div>
+  <div>Coverage: <b>{cov}</b></div>
+  <div>Type: <b>{cov_type}</b></div>
 </div>
 
 <div style="margin-top:14px; display:flex; gap:10px; flex-wrap:wrap;">
@@ -1282,6 +1346,7 @@ def delete_lead(lead_id: int):
         return RedirectResponse("/dashboard", status_code=303)
     finally:
         db.close()
+
 
 # =========================
 # Actions / Activity
@@ -1339,6 +1404,7 @@ def activity():
     finally:
         db.close()
 
+
 # =========================
 # Admin
 # =========================
@@ -1357,15 +1423,11 @@ def admin_page():
         <form method="post" action="/admin/wipe" onsubmit="return confirm('This permanently deletes everything. Are you sure?');">
           <div style="opacity:.8">Type DELETE ALL LEADS:</div>
           <input name="confirm" style="margin-top:8px;padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
-          <button style="margin-left:10px;background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
+          <div style="margin-top:10px;">
+            <input name="token" placeholder="ADMIN_TOKEN" style="padding:10px;border-radius:12px;border:1px solid rgba(50,74,110,.35);background:#0b0f17;color:#e6edf3;width:320px" />
+          </div>
+          <button style="margin-top:10px;background:rgba(192,58,58,.18);border:1px solid rgba(192,58,58,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
             Permanently Delete
-          </button>
-        </form>
-
-        <h3 style="margin:18px 0 10px 0;">Clear Actions Only</h3>
-        <form method="post" action="/admin/clear-actions" onsubmit="return confirm('Clear all actions?');">
-          <button style="background:#111827;border:1px solid rgba(50,74,110,.35);color:#e6edf3;padding:10px 14px;border-radius:12px;cursor:pointer;font-weight:900;">
-            Clear Action Queue
           </button>
         </form>
 
@@ -1382,20 +1444,8 @@ def admin_page():
 
 @app.post("/admin/pause-toggle")
 def admin_pause_toggle(request: Request, token: str = Form("")):
-    class FakeReq:
-        def __init__(self, req, token):
-            self.headers = dict(req.headers)
-            self.query_params = dict(req.query_params)
-            if token:
-                self.query_params["token"] = token
-
-    req2 = FakeReq(request, token)
-
-    if not require_admin(req2):
-        return HTMLResponse(
-            "<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Missing or invalid ADMIN_TOKEN.</div>",
-            status_code=401
-        )
+    if not require_admin(request, token_from_form=token):
+        return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Missing or invalid ADMIN_TOKEN.</div>", status_code=401)
 
     db = SessionLocal()
     try:
@@ -1408,10 +1458,10 @@ def admin_pause_toggle(request: Request, token: str = Form("")):
         db.close()
 
 @app.post("/admin/wipe")
-async def admin_wipe(request: Request, confirm: str = Form(...)):
+async def admin_wipe(request: Request, confirm: str = Form(...), token: str = Form("")):
     if confirm.strip() != "DELETE ALL LEADS":
         return JSONResponse({"error": "Confirmation text does not match"}, status_code=400)
-    if not require_admin(request):
+    if not require_admin(request, token_from_form=token):
         return JSONResponse({"error": "Missing or invalid ADMIN_TOKEN"}, status_code=401)
 
     db = SessionLocal()
@@ -1427,61 +1477,9 @@ async def admin_wipe(request: Request, confirm: str = Form(...)):
     finally:
         db.close()
 
-@app.post("/admin/clear-actions")
-async def admin_clear_actions(request: Request):
-    if not require_admin(request):
-        return JSONResponse({"error": "Missing or invalid ADMIN_TOKEN"}, status_code=401)
-    db = SessionLocal()
-    try:
-        db.execute(text("DELETE FROM actions"))
-        db.commit()
-        return JSONResponse({"ok": True, "message": "Actions cleared."})
-    finally:
-        db.close()
 
 # =========================
-# Uploads
-# =========================
-@app.get("/uploads", response_class=HTMLResponse)
-def uploads_page():
-    return HTMLResponse("""
-    <html>
-    <body style="background:#0b0f17;color:#e6edf3;font-family:system-ui;padding:24px;max-width:900px;margin:0 auto;">
-      <a href="/dashboard" style="color:#8ab4f8;text-decoration:none;"><- Back</a>
-      <h2>Upload Leads</h2>
-
-      <hr style="opacity:.2">
-
-      <h3>Upload CSV</h3>
-      <form action="/import/csv" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".csv" required />
-        <br><br>
-        <button type="submit">Upload CSV</button>
-      </form>
-
-      <hr style="opacity:.2">
-
-      <h3>Upload PDF</h3>
-      <form action="/import/pdf" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept="application/pdf" required />
-        <br><br>
-        <button type="submit">Upload PDF</button>
-      </form>
-
-      <hr style="opacity:.2">
-
-      <h3>Upload Image</h3>
-      <form action="/import/image" method="post" enctype="multipart/form-data">
-        <input type="file" name="file" accept="image/*" required />
-        <br><br>
-        <button type="submit">Upload Image</button>
-      </form>
-    </body>
-    </html>
-    """)
-
-# =========================
-# Twilio Webhooks
+# Twilio Webhooks: inbound SMS + recordings
 # =========================
 @app.post("/twilio/sms/inbound")
 def twilio_sms_inbound(
@@ -1500,6 +1498,11 @@ def twilio_sms_inbound(
         if not lead:
             _log(db, None, None, "SMS_IN_UNKNOWN", f"From={from_phone} Body={body}")
             db.commit()
+            try:
+                fake = type("X", (), {"id": 0, "full_name": "Unknown Lead", "phone": from_phone})()
+                notify_owner(db, fake, body, tag="LEAD_REPLIED_UNKNOWN")
+            except Exception:
+                pass
             return Response(content="<Response></Response>", media_type="text/xml")
 
         db.add(Message(
@@ -1512,34 +1515,30 @@ def twilio_sms_inbound(
             provider_sid=MessageSid or "",
             created_at=_now(),
         ))
-
         _log(db, lead.id, None, "SMS_IN", body)
+        db.commit()
 
-        low = body.lower()
+        # Always forward inbound reply to your phone
+        notify_owner(db, lead, body, tag="LEAD_REPLIED")
 
-        if any(x in low for x in ["stop", "unsubscribe", "do not contact", "dont contact", "dnc"]):
+        intent = classify_inbound_text(body)
+
+        if intent == "STOP":
             lead.state = "DO_NOT_CONTACT"
             lead.updated_at = _now()
             cancel_pending_actions(db, lead.id, "Inbound STOP/DNC")
             _log(db, lead.id, None, "COMPLIANCE_DNC", "Lead opted out via SMS")
             db.commit()
+            notify_owner(db, lead, "Lead opted out (STOP/DNC).", tag="DNC")
             return Response(content="<Response></Response>", media_type="text/xml")
 
-        if any(x in low for x in ["call me", "ready", "yes", "now", "interested", "today"]):
-            lead.state = "CONTACTED"
+        if intent in ["HOT", "QUESTION", "NEUTRAL", "APPT"]:
+            # You asked for conservative behavior: tell you to call / take over
+            lead.state = "CONTACTED" if intent == "HOT" else "WORKING"
             lead.updated_at = _now()
-            _log(db, lead.id, None, "HOT_LEAD_DETECTED", body)
-            try:
-                send_alert_sms(f"HOT LEAD: {lead.full_name} {lead.phone} replied: {body}")
-            except Exception as e:
-                _log(db, lead.id, None, "ALERT_ERROR", str(e))
             db.commit()
-            return Response(content="<Response></Response>", media_type="text/xml")
+            notify_owner(db, lead, f"Lead reply requires your attention ({intent}). Call them.", tag="CALL_THIS_LEAD")
 
-        if lead.state == "NEW":
-            lead.state = "WORKING"
-        lead.updated_at = _now()
-        db.commit()
         return Response(content="<Response></Response>", media_type="text/xml")
     finally:
         db.close()
@@ -1554,15 +1553,8 @@ def twilio_recording(
     try:
         playable = (RecordingUrl or "").strip()
         mp3 = playable + ".mp3" if playable and not playable.endswith(".mp3") else playable
-        _log(
-            db,
-            None,
-            None,
-            "CALL_RECORDING",
-            f"callSid={CallSid} recordingSid={RecordingSid} url={playable} mp3={mp3}"
-        )
+        _log(db, None, None, "CALL_RECORDING", f"callSid={CallSid} recordingSid={RecordingSid} url={playable} mp3={mp3}")
         db.commit()
         return {"ok": True}
     finally:
         db.close()
-
