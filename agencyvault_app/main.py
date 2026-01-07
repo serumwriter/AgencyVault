@@ -678,122 +678,61 @@ def render_action(a):
 </div>
 
 # =========================
-# Planner (creates PENDING actions)
+# Planner helpers
 # =========================
 def ai_schedule_appointment(db, lead_id: int, note: str = "Call"):
     """
-    #AI-only scheduler.
-    Finds the next open 30-minute slot and books it.
+    AI-only scheduler.
+    Finds the next open 30-minute slot and creates an APPOINTMENT action.
     """
 
     # 1. Get existing appointments
     appts = (
         db.query(Action)
-        .filter(Action.kind == "APPOINTMENT")
+        .filter(Action.type == "APPOINTMENT")
         .order_by(Action.created_at.asc())
         .all()
     )
 
-    # 2. Build blocked times (simple version)
-    blocked = []
+    # 2. Build blocked times
+    blocked = set()
     for a in appts:
-        payload = a.payload or {}
+        payload = json.loads(a.payload_json or "{}")
         when = payload.get("when")
         if when:
-            blocked.append(when)
+            blocked.add(when)
 
-    # 3. Pick next available slot (VERY SAFE DEFAULT)
-    from datetime import datetime, timedelta
-
+    # 3. Pick next available slot (safe default)
     now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     candidate = now + timedelta(hours=1)
 
-    for _ in range(48):  # look ahead ~2 days
-        slot = candidate.strftime("%Y-%m-%d %H:%M")
-        if slot not in blocked:
+    slot = None
+    for _ in range(48):  # ~2 days lookahead
+        candidate_slot = candidate.strftime("%Y-%m-%d %H:%M")
+        if candidate_slot not in blocked:
+            slot = candidate_slot
             break
         candidate += timedelta(minutes=30)
 
-    # 4. Create appointment
-    create_task(
-        db,
-        kind="APPOINTMENT",
+    if not slot:
+        return  # fail silently, never crash planner
+
+    # 4. Create appointment action
+    db.add(Action(
         lead_id=lead_id,
-        payload={
+        type="APPOINTMENT",
+        status="PENDING",
+        tool="internal",
+        payload_json=json.dumps({
             "when": slot,
             "note": note,
             "tz": "local",
             "name": "AI Scheduled Call",
-        },
-    )
+        }),
+        created_at=_now(),
+    ))
 
-    log_event(db, "ai_schedule", f"AI scheduled call for lead {lead_id} at {slot}")
-
-def plan_actions(db: Session, batch_size: int = 25) -> Dict[str, Any]:
-    run = AgentRun(mode="planning", status="STARTED", batch_size=batch_size, notes="Planner run")
-    db.add(run)
-    db.flush()
-
-    planned = 0
-    considered = 0
-    nowv = _now()
-
-    leads = (
-        db.query(Lead)
-        .filter(Lead.state == "NEW")
-        .order_by(Lead.created_at.asc())
-        .limit(batch_size)
-        .all()
-    )
-
-    for lead in leads:
-        considered += 1
-
-        if not (lead.phone or "").strip():
-            continue
-
-        if not (lead.timezone or "").strip():
-            lead.timezone = infer_timezone_from_phone(lead.phone)
-
-        first = safe_first_name(lead.full_name)
-
-        msg1 = (
-            f"Hi{(' ' + first) if first else ''}, this is Nick's office. "
-            "You requested life insurance information. "
-            "Would you like a quick quote today?"
-        )
-
-        db.add(Action(
-            lead_id=lead.id,
-            type="TEXT",
-            status="PENDING",
-            tool="twilio",
-            payload_json=json.dumps({"to": lead.phone, "message": msg1}),
-            created_at=nowv,
-        ))
-        planned += 1
-
-        call_due = (nowv + timedelta(minutes=15)).isoformat()
-        db.add(Action(
-            lead_id=lead.id,
-            type="CALL",
-            status="PENDING",
-            tool="twilio",
-            payload_json=json.dumps({"to": lead.phone, "lead_id": lead.id, "due_at": call_due}),
-            created_at=nowv,
-        ))
-        planned += 1
-
-        lead.state = "WORKING"
-        lead.updated_at = nowv
-
-    run.status = "SUCCEEDED"
-    run.finished_at = _now()
-    db.commit()
-
-    _log(db, None, run.id, "AI_PLANNED", f"planned={planned} considered={considered}")
-    db.commit()
-    return {"ok": True, "run_id": run.id, "planned_actions": planned, "considered": considered}
+    _log(db, None, lead_id, "AI_APPOINTMENT_PLANNED", f"slot={slot}")
 
 @app.get("/ai/plan")
 def ai_plan():
