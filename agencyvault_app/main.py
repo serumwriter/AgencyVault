@@ -796,37 +796,59 @@ def ai_plan():
 def agenda():
     db = SessionLocal()
     try:
-        actions = (
-            db.query(Action)
-            .filter(Action.status == "PENDING")
-            .order_by(Action.created_at.asc())
-            .limit(150)
-            .all()
-        )
+      
+      actions = (
+    db.query(Action, Lead)
+    .join(Lead, Lead.id == Action.lead_id)
+    .filter(Action.status == "PENDING")
+    .order_by(Action.created_at.asc())
+    .limit(1)
+    .all()
+)
 
-        rows = ""
-        for a in actions:
-            rows += f"""
-            <div style="border-bottom:1px solid #333;padding:12px 0">
-              <div><b>Action:</b> {a.type}</div>
-              <div><b>Lead ID:</b> {a.lead_id}</div>
+if not actions:
+    body = "<p>No tasks right now. Click Start My Workday.</p>"
+else:
+    a, l = actions[0]
 
-              <form method="post" action="/agenda/report" style="margin-top:8px">
-                <input type="hidden" name="action_id" value="{a.id}" />
+    payload = json.loads(a.payload_json or "{}")
+    due = payload.get("due_at")
+    reason = payload.get("reason", "AI decided this is next")
 
-                <textarea name="note"
-                  placeholder="Paste what the lead said or write notes here"
-                  style="width:100%;min-height:60px;margin-top:6px"></textarea>
+    when = "Do now"
+    if due:
+        when = f"Scheduled for {due}"
 
-                <div style="margin-top:8px">
-                  <button type="submit" name="outcome" value="talked">Talked / Replied</button>
-                  <button type="submit" name="outcome" value="no_answer">No answer</button>
-                  <button type="submit" name="outcome" value="not_interested">Not interested</button>
-                  <button type="submit" name="outcome" value="booked">Booked</button>
-                </div>
-              </form>
-            </div>
-            """
+    body = f"""
+    <h2>Next Task</h2>
+
+    <div style="margin-top:10px">
+      <b>Lead:</b> {l.full_name or "Unknown"}<br>
+      <b>Phone:</b> {l.phone}<br>
+      <b>Status:</b> {l.state}
+    </div>
+
+    <div style="margin-top:10px">
+      <b>Action:</b> {a.type}<br>
+      <b>When:</b> {when}<br>
+      <b>Why:</b> {reason}
+    </div>
+
+    <form method="post" action="/agenda/report" style="margin-top:14px">
+      <input type="hidden" name="action_id" value="{a.id}" />
+
+      <textarea name="note"
+        placeholder="Paste what the lead said, or what happened"
+        style="width:100%;min-height:80px;margin-top:10px"></textarea>
+
+      <div style="margin-top:10px">
+        <button type="submit" name="outcome" value="talked">Talked / Replied</button>
+        <button type="submit" name="outcome" value="no_answer">No Answer</button>
+        <button type="submit" name="outcome" value="not_interested">Not Interested</button>
+        <button type="submit" name="outcome" value="booked">Booked</button>
+      </div>
+    </form>
+    """
 
         return HTMLResponse(f"""
         <html>
@@ -836,7 +858,7 @@ def agenda():
         <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
           <h1>AI Agenda (What to do now)</h1>
           <p>This page tells you exactly what to do. Complete items top to bottom.</p>
-          {rows if rows else "<p>No pending actions.</p>"}
+          {body}
         </body>
         </html>
         """)
