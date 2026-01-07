@@ -1442,20 +1442,83 @@ async def import_pdf(file: UploadFile = File(...)):
         if not data:
             return HTMLResponse("Empty upload", status_code=400)
 
+        # Extract all text from the PDF
         text_data = extract_text_from_pdf_bytes(data)
         if not (text_data or "").strip():
             _log(db, None, None, "IMPORT_PDF_EMPTY", "No readable PDF text")
             db.commit()
             return RedirectResponse("/dashboard", status_code=303)
 
+        # Normalize into structured lead dicts
         leads = normalize_to_leads(text_data)
 
-        added = 0
-        for lead in leads:
-            if _import_row(db, lead):
-                added += 1
+        created = 0
+        merged = 0
+        skipped = 0
+        errors = 0
 
-        _log(db, None, None, "IMPORT_PDF", f"imported={added}")
+        for item in leads:
+            try:
+                # --- DEFINE VARIABLES FIRST (NO NameError POSSIBLE) ---
+                phone = normalize_phone(item.get("phone") or "")
+                email = clean_text(item.get("email") or "")
+                full_name = clean_text(item.get("full_name") or "")
+                tz = infer_timezone_from_phone(phone) if phone else None
+
+                # Require at least one contact method
+                if not phone and not email:
+                    skipped += 1
+                    continue
+
+                # Dedupe / merge
+                existing = None
+                if phone:
+                    existing = db.query(Lead).filter(Lead.phone == phone).first()
+                elif email:
+                    existing = db.query(Lead).filter(Lead.email == email).first()
+
+                if existing:
+                    # Merge extra fields into LeadMemory
+                    for k, v in item.items():
+                        if k in ["full_name", "phone", "email"] or not v:
+                            continue
+                        _mem_upsert(db, existing.id, k, str(v))
+                    merged += 1
+                    continue
+
+                # --- CREATE LEAD (ONLY VALID MODEL FIELDS) ---
+                lead = Lead(
+                    full_name=full_name or "Unknown",
+                    phone=phone or "UNKNOWN",
+                    email=email or None,
+                    state="NEW",
+                    timezone=tz,
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+                db.add(lead)
+                db.flush()  # REQUIRED
+
+                # --- STORE ALL EXTRA DATA SAFELY ---
+                for k, v in item.items():
+                    if k in ["full_name", "phone", "email"] or not v:
+                        continue
+                    _mem_upsert(db, lead.id, k, str(v))
+
+                created += 1
+
+            except Exception as e:
+                errors += 1
+                _log(db, None, None, "PDF_IMPORT_ROW_ERROR", str(e)[:300])
+
+        _log(
+            db,
+            None,
+            None,
+            "IMPORT_PDF",
+            f"created={created} merged={merged} skipped={skipped} errors={errors}",
+        )
+
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
 
