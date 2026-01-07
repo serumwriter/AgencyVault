@@ -682,8 +682,7 @@ def render_action(a):
 # =========================
 def ai_schedule_appointment(db, lead_id: int, note: str = "Call"):
     """
-    AI-only scheduler.
-    Finds the next open 30-minute slot and creates an APPOINTMENT action.
+    # AI-only scheduler. Finds the next open 30-minute slot and creates an APPOINTMENT action.
     """
 
     # 1. Get existing appointments
