@@ -682,7 +682,7 @@ def render_action(a):
 # =========================
 def ai_schedule_appointment(db, lead_id: int, note: str = "Call"):
     """
-    AI-only scheduler.
+    #AI-only scheduler.
     Finds the next open 30-minute slot and books it.
     """
 
