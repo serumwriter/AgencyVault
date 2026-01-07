@@ -266,9 +266,12 @@ def normalize_to_leads(data: Any) -> List[Dict[str, Any]]:
     """
     leads: List[Dict[str, Any]] = []
 
-    # CSV rows
-    if isinstance(data, list):
-        for row in data:
+   # CSV rows
+if isinstance(data, list):
+    for row in data:
+
+        # --- CASE 1: header-based CSV (dict) ---
+        if isinstance(row, dict):
             clean = {}
             for k, v in (row or {}).items():
                 if not k:
@@ -283,27 +286,39 @@ def normalize_to_leads(data: Any) -> List[Dict[str, Any]]:
             if not full_name:
                 full_name = f"{first or ''} {last or ''}".strip() or None
 
-            phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell") or clean.get("cell phone")
+            phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell")
             email = clean.get("email")
             st = clean.get("state") or clean.get("st")
             dob = clean.get("dob") or clean.get("date of birth") or clean.get("birthdate")
-            cov = clean.get("coverage") or clean.get("coverage amount") or clean.get("desired coverage") or clean.get("desired coverage amount")
-            cov_type = clean.get("coverage type") or clean.get("policy type") or clean.get("type")
-            source = clean.get("source") or clean.get("lead source")
-            ref = clean.get("lead id") or clean.get("reference") or clean.get("inquiry id") or clean.get("id")
+            cov_type = clean.get("policy type") or clean.get("type")
+            source = clean.get("source") or clean.get("vendor")
 
-            leads.append({
-                "full_name": full_name,
-                "phone": phone,
-                "email": email,
-                "state": st,
-                "birthdate": dob,
-                "coverage_requested": cov,
-                "coverage_type": cov_type,
-                "lead_source": source,
-                "lead_reference": ref,
-            })
-        return leads
+        # --- CASE 2: headerless positional CSV (YOUR FILES) ---
+        elif isinstance(row, (list, tuple)) and len(row) >= 5:
+            first = (row[0] or "").strip()
+            last = (row[1] or "").strip()
+            cov_type = (row[2] or "").strip()      # IUL
+            source = (row[3] or "").strip()        # GOAT
+            phone = (row[4] or "").strip()
+            dob = (row[6] or "").strip() if len(row) > 6 else None
+            email = (row[7] or "").strip() if len(row) > 7 else None
+            st = (row[8] or "").strip() if len(row) > 8 else None
+            full_name = f"{first} {last}".strip() or None
+
+        else:
+            continue
+
+        leads.append({
+            "full_name": full_name,
+            "phone": phone,
+            "email": email,
+            "state": st,
+            "birthdate": dob,
+            "coverage_type": cov_type,
+            "lead_source": source,
+        })
+
+    return leads
 
     # Text parse (PDF / OCR / Doc)
     raw = (data or "")
