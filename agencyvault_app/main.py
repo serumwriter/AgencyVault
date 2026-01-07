@@ -167,8 +167,7 @@ def mem_set(db: Session, lead_id: int, key: str, value: str):
     if row:
         row.value = v
         row.updated_at = _now()
-    else:
-        db.add(LeadMemory(lead_id=lead_id, key=key, value=v, updated_at=_now()))
+    else:mem_set(db, lead_id, key, v)
 
 def mem_bulk_set(db: Session, lead_id: int, d: Dict[str, Any]):
     for k, v in (d or {}).items():
@@ -2204,12 +2203,7 @@ def agenda_report(
 
         # Save human notes so AI can reason
         if note:
-            db.add(LeadMemory(
-                lead_id=action.lead_id,
-                key="last_human_note",
-                value=note[:2000],
-                updated_at=datetime.utcnow(),
-            ))
+           mem_set(db, lead.id, "last_human_note", note)
 
         # Log outcome for AI decision-making
         db.add(AuditLog(
