@@ -745,23 +745,21 @@ def ai_plan():
 def agenda():
     db = SessionLocal()
     try:
-        actions = (
+        row = (
             db.query(Action, Lead)
             .join(Lead, Lead.id == Action.lead_id)
             .filter(Action.status == "PENDING")
             .order_by(Action.created_at.asc())
-            .limit(1)
-            .all()
+            .first()
         )
 
-        if not actions:
-            body = "<p>No tasks right now. Click Start My Workday.</p>"
+        if not row:
+            body = "<p>No tasks right now. Click <b>Start My Workday</b>.</p>"
         else:
-            a, l = actions[0]
-
+            a, l = row
             payload = json.loads(a.payload_json or "{}")
-            due = payload.get("due_at")
             reason = payload.get("reason", "AI decided this is next")
+            due = payload.get("due_at")
 
             when = "Do now"
             if due:
@@ -786,7 +784,7 @@ def agenda():
               <input type="hidden" name="action_id" value="{a.id}" />
 
               <textarea name="note"
-                placeholder="Paste what the lead said, or what happened"
+                placeholder="Paste what the lead said or what happened"
                 style="width:100%;min-height:80px;margin-top:10px"></textarea>
 
               <div style="margin-top:10px">
@@ -800,9 +798,7 @@ def agenda():
 
         return HTMLResponse(f"""
         <html>
-        <head>
-          <title>Agenda</title>
-        </head>
+        <head><title>Agenda</title></head>
         <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
           <h1>AI Agenda (What to do now)</h1>
           <p>This page tells you exactly what to do. Complete items top to bottom.</p>
