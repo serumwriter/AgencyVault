@@ -25,6 +25,11 @@ class Lead(Base):
     actions: Mapped[list["Action"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
     memory: Mapped[list["LeadMemory"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
     messages: Mapped[list["Message"]] = relationship(back_populates="lead", cascade="all, delete-orphan")
+    timezone: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        index=True,
+    )
 
 class Action(Base):
     __tablename__ = "actions"
