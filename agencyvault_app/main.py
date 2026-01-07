@@ -2133,3 +2133,40 @@ def google_callback(code: str):
         "ok": True,
         "received_code": bool(code)
     }
+
+@app.post("/agenda/report")
+def agenda_report(
+    action_id: int = Form(...),
+    outcome: str = Form(...),
+    note: str = Form(""),
+):
+    db = SessionLocal()
+    try:
+        action = db.query(Action).filter(Action.id == action_id).first()
+        if not action:
+            return RedirectResponse("/agenda", status_code=303)
+
+        # Mark the action as completed by human
+        action.status = "DONE"
+
+        # Save human notes so AI can reason
+        if note:
+            db.add(LeadMemory(
+                lead_id=action.lead_id,
+                key="last_human_note",
+                value=note[:2000],
+                updated_at=datetime.utcnow(),
+            ))
+
+        # Log outcome for AI decision-making
+        db.add(AuditLog(
+            lead_id=action.lead_id,
+            event="HUMAN_OUTCOME",
+            detail=f"outcome={outcome} note={note[:500]}",
+        ))
+
+        db.commit()
+    finally:
+        db.close()
+
+    return RedirectResponse("/agenda", status_code=303)
