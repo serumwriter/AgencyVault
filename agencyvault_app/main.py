@@ -1440,40 +1440,52 @@ def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
     return {r.key: r.value for r in rows}
     
 @app.post("/import/csv")
-def import_csv(file: UploadFile = File(...)):
+async def import_csv(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
-        content = file.file.read().decode("utf-8", errors="ignore")
+        content = await file.read()
+        if not content:
+            return RedirectResponse("/dashboard", status_code=303)
 
-        # Try header-based first
-        reader = csv.DictReader(io.StringIO(content))
+        text = content.decode("utf-8", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
         rows = list(reader)
-        if not rows or all(not any(r.values()) for r in rows):
-            # Fallback to positional CSV
-            rows = list(csv.reader(io.StringIO(content)))
 
-        normalized = normalize_to_leads(rows)
+        leads = normalize_to_leads(rows)
 
         imported = 0
+        merged = 0
         skipped = 0
 
-        for item in normalized:
-            phone = normalize_phone(item.get("phone"))
-            email = item.get("email")
-            if not phone:
+        for item in leads:
+            phone = normalize_phone(item.get("phone") or "")
+            email = clean_text(item.get("email") or "")
+
+            if not phone and not email:
                 skipped += 1
                 continue
 
-            if dedupe_exists(db, phone, email):
-                skipped += 1
+            existing = None
+            if phone:
+                existing = db.query(Lead).filter(Lead.phone == phone).first()
+            elif email:
+                existing = db.query(Lead).filter(Lead.email == email).first()
+
+            if existing:
+                # merge
+                for k, v in item.items():
+                    if k in ["full_name", "phone", "email"] or not v:
+                        continue
+                    _mem_upsert(db, existing.id, k, str(v))
+                merged += 1
                 continue
 
             lead = Lead(
                 full_name=item.get("full_name") or "Unknown",
-                phone=phone,
-                email=email,
+                phone=phone or "UNKNOWN",
+                email=email or None,
                 state="NEW",
-                timezone=infer_timezone_from_phone(phone),
+                timezone=infer_timezone_from_phone(phone) if phone else None,
                 created_at=_now(),
                 updated_at=_now(),
             )
@@ -1483,17 +1495,16 @@ def import_csv(file: UploadFile = File(...)):
             for k, v in item.items():
                 if k in ["full_name", "phone", "email"] or not v:
                     continue
-                db.add(LeadMemory(
-                    lead_id=lead.id,
-                    key=k,
-                    value=str(v),
-                ))
+                _mem_upsert(db, lead.id, k, str(v))
 
             imported += 1
 
-        _log(db, None, None, "CSV_IMPORTED", f"imported={imported} skipped={skipped}")
+        _log(db, None, None, "IMPORT_CSV",
+             f"imported={imported} merged={merged} skipped={skipped}")
+
         db.commit()
-        return RedirectResponse(f"/dashboard?imported={imported}&skipped={skipped}", status_code=303)
+        return RedirectResponse("/dashboard", status_code=303)
+
     finally:
         db.close()
 
