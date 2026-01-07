@@ -1157,13 +1157,12 @@ def dashboard():
     <div class="grid">
       <div class="panel">
         <h2>Distribution</h2>
-        <div class="donuts">
-          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div></div>
-          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div></div>
-          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div></div>
-          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div></div>
-        </div>
-      </div>
+        <div class="muted">
+  NEW: {new} ({pct_new:.1f}%)<br>
+  WORKING: {working} ({pct_working:.1f}%)<br>
+  CONTACTED: {contacted} ({pct_contacted:.1f}%)<br>
+  DNC: {dnc} ({pct_dnc:.1f}%)
+</div>
 
       <div class="panel">
         <h2>Imports</h2>
