@@ -1888,3 +1888,26 @@ def twilio_recording(
         return {"ok": True}
     finally:
         db.close()
+@app.post("/test/twilio/text")
+def test_twilio_text():
+    db = SessionLocal()
+    try:
+        lead = db.query(Lead).order_by(Lead.created_at.desc()).first()
+        if not lead:
+            return {"ok": False, "error": "No leads found"}
+
+        db.add(Action(
+            lead_id=lead.id,
+            type="TEXT",
+            status="PENDING",
+            tool="twilio",
+            payload_json=json.dumps({
+                "to": lead.phone,
+                "message": "Twilio test: if you got this, SMS is working."
+            }),
+            created_at=_now(),
+        ))
+        db.commit()
+        return {"ok": True, "message": "Test SMS action created"}
+    finally:
+        db.close()
