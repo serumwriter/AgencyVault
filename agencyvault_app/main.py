@@ -1154,15 +1154,6 @@ def dashboard():
       <div class="kpi"><div class="kpi-label">Pending</div><div class="kpi-value">{pending}</div><div class="kpi-sub">Queued actions</div></div>
     </div>
 
-    <div class="grid">
-      <div class="panel">
-        <h2>Distribution</h2>
-        <div class="muted">
-  NEW: {new} ({pct_new:.1f}%)<br>
-  WORKING: {working} ({pct_working:.1f}%)<br>
-  CONTACTED: {contacted} ({pct_contacted:.1f}%)<br>
-  DNC: {dnc} ({pct_dnc:.1f}%)
-</div>
 
       <div class="panel">
         <h2>Imports</h2>
@@ -1195,13 +1186,27 @@ def dashboard():
         <div>{leads_html or '<div class="muted">No leads yet.</div>'}</div>
       </div>
 
-      <div class="panel">
-        <h2>Calendar</h2>
-        {appt_html}
-        <div style="margin-top:10px" class="muted">
-          Google Calendar sync will go here. Once connected, AI will not schedule over existing blocks.
-        </div>
-      </div>
+     <div class="grid">
+
+  <div class="panel">
+    <h2>Distribution</h2>
+    <div class="muted">
+      NEW: {new} ({pct_new:.1f}%)<br>
+      WORKING: {working} ({pct_working:.1f}%)<br>
+      CONTACTED: {contacted} ({pct_contacted:.1f}%)<br>
+      DNC: {dnc} ({pct_dnc:.1f}%)
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Calendar</h2>
+    {appt_html}
+    <div style="margin-top:10px" class="muted">
+      Google Calendar sync will go here. Once connected, AI will not schedule over existing blocks.
+    </div>
+  </div>
+
+
 
       <div class="panel">
         <h2>Live Activity Feed</h2>
