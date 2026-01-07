@@ -892,21 +892,6 @@ def dashboard():
 
         pause_label = "Paused" if paused else "Running"
 
-        def svg_donut(pct: float) -> str:
-            pct = max(0.0, min(100.0, pct))
-            r = 16
-            c = 2 * 3.14159 * r
-            dash = (pct / 100.0) * c
-            gap = c - dash
-            return f"""
-            <svg width="44" height="44" viewBox="0 0 44 44" aria-label="{pct:.0f}%">
-              <circle cx="22" cy="22" r="{r}" fill="none" stroke="rgba(138,180,248,.15)" stroke-width="6"></circle>
-              <circle cx="22" cy="22" r="{r}" fill="none" stroke="rgba(138,180,248,.95)" stroke-width="6"
-                      stroke-dasharray="{dash:.2f} {gap:.2f}" transform="rotate(-90 22 22)"></circle>
-              <text x="22" y="25" text-anchor="middle" font-size="10" fill="rgba(230,237,243,.85)">{pct:.0f}%</text>
-            </svg>
-            """
-
         return HTMLResponse(f"""
 <!doctype html>
 <html>
@@ -1173,10 +1158,10 @@ def dashboard():
       <div class="panel">
         <h2>Distribution</h2>
         <div class="donuts">
-          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div>{svg_donut(pct_new)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div>{svg_donut(pct_working)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div>{svg_donut(pct_contacted)}</div>
-          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div>{svg_donut(pct_dnc)}</div>
+          <div class="donut-card"><div><div style="font-weight:900">NEW</div><div class="muted">{new} of {total}</div></div></div>
+          <div class="donut-card"><div><div style="font-weight:900">WORKING</div><div class="muted">{working} of {total}</div></div></div>
+          <div class="donut-card"><div><div style="font-weight:900">CONTACTED</div><div class="muted">{contacted} of {total}</div></div></div>
+          <div class="donut-card"><div><div style="font-weight:900">DNC</div><div class="muted">{dnc} of {total}</div></div></div>
         </div>
       </div>
 
