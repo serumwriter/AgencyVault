@@ -796,59 +796,58 @@ def ai_plan():
 def agenda():
     db = SessionLocal()
     try:
-      
-      actions = (
-    db.query(Action, Lead)
-    .join(Lead, Lead.id == Action.lead_id)
-    .filter(Action.status == "PENDING")
-    .order_by(Action.created_at.asc())
-    .limit(1)
-    .all()
-)
+        actions = (
+            db.query(Action, Lead)
+            .join(Lead, Lead.id == Action.lead_id)
+            .filter(Action.status == "PENDING")
+            .order_by(Action.created_at.asc())
+            .limit(1)
+            .all()
+        )
 
-if not actions:
-    body = "<p>No tasks right now. Click Start My Workday.</p>"
-else:
-    a, l = actions[0]
+        if not actions:
+            body = "<p>No tasks right now. Click Start My Workday.</p>"
+        else:
+            a, l = actions[0]
 
-    payload = json.loads(a.payload_json or "{}")
-    due = payload.get("due_at")
-    reason = payload.get("reason", "AI decided this is next")
+            payload = json.loads(a.payload_json or "{}")
+            due = payload.get("due_at")
+            reason = payload.get("reason", "AI decided this is next")
 
-    when = "Do now"
-    if due:
-        when = f"Scheduled for {due}"
+            when = "Do now"
+            if due:
+                when = f"Scheduled for {due}"
 
-    body = f"""
-    <h2>Next Task</h2>
+            body = f"""
+            <h2>Next Task</h2>
 
-    <div style="margin-top:10px">
-      <b>Lead:</b> {l.full_name or "Unknown"}<br>
-      <b>Phone:</b> {l.phone}<br>
-      <b>Status:</b> {l.state}
-    </div>
+            <div style="margin-top:10px">
+              <b>Lead:</b> {l.full_name or "Unknown"}<br>
+              <b>Phone:</b> {l.phone}<br>
+              <b>Status:</b> {l.state}
+            </div>
 
-    <div style="margin-top:10px">
-      <b>Action:</b> {a.type}<br>
-      <b>When:</b> {when}<br>
-      <b>Why:</b> {reason}
-    </div>
+            <div style="margin-top:10px">
+              <b>Action:</b> {a.type}<br>
+              <b>When:</b> {when}<br>
+              <b>Why:</b> {reason}
+            </div>
 
-    <form method="post" action="/agenda/report" style="margin-top:14px">
-      <input type="hidden" name="action_id" value="{a.id}" />
+            <form method="post" action="/agenda/report" style="margin-top:14px">
+              <input type="hidden" name="action_id" value="{a.id}" />
 
-      <textarea name="note"
-        placeholder="Paste what the lead said, or what happened"
-        style="width:100%;min-height:80px;margin-top:10px"></textarea>
+              <textarea name="note"
+                placeholder="Paste what the lead said, or what happened"
+                style="width:100%;min-height:80px;margin-top:10px"></textarea>
 
-      <div style="margin-top:10px">
-        <button type="submit" name="outcome" value="talked">Talked / Replied</button>
-        <button type="submit" name="outcome" value="no_answer">No Answer</button>
-        <button type="submit" name="outcome" value="not_interested">Not Interested</button>
-        <button type="submit" name="outcome" value="booked">Booked</button>
-      </div>
-    </form>
-    """
+              <div style="margin-top:10px">
+                <button type="submit" name="outcome" value="talked">Talked / Replied</button>
+                <button type="submit" name="outcome" value="no_answer">No Answer</button>
+                <button type="submit" name="outcome" value="not_interested">Not Interested</button>
+                <button type="submit" name="outcome" value="booked">Booked</button>
+              </div>
+            </form>
+            """
 
         return HTMLResponse(f"""
         <html>
