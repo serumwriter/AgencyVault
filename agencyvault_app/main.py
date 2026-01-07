@@ -257,67 +257,126 @@ def extract_text_from_image_bytes(data: bytes) -> str:
 # =========================
 # Lead normalization (CSV + Text blocks)
 # =========================
-def normalize_to_leads(data: Any) -> List[Dict[str, Any]]:
+def normalize_to_leads(data):
     """
     Accepts:
-      - list[dict] (CSV rows)
-      - raw text string (PDF/image/doc extraction)
-    Returns list of normalized lead dicts.
+      - list[dict]  (CSV with headers)
+      - list[list]  (CSV without headers)
+      - raw text    (PDF / OCR)
+    Returns: list of normalized lead dicts
     """
-    leads: List[Dict[str, Any]] = []
+    leads = []
 
-   # CSV rows
-if isinstance(data, list):
-    for row in data:
+    # -------------------------
+    # CSV (list-based)
+    # -------------------------
+    if isinstance(data, list):
+        for row in data:
 
-        # --- CASE 1: header-based CSV (dict) ---
-        if isinstance(row, dict):
-            clean = {}
-            for k, v in (row or {}).items():
-                if not k:
-                    continue
-                kk = str(k).strip().lower()
-                vv = v.strip() if isinstance(v, str) else v
-                clean[kk] = vv
+            # HEADER-BASED CSV
+            if isinstance(row, dict):
+                clean = {}
+                for k, v in row.items():
+                    if not k:
+                        continue
+                    kk = str(k).strip().lower()
+                    vv = v.strip() if isinstance(v, str) else v
+                    clean[kk] = vv
 
-            first = clean.get("first name") or clean.get("firstname") or clean.get("first")
-            last = clean.get("last name") or clean.get("lastname") or clean.get("last")
-            full_name = clean.get("full name") or clean.get("name")
-            if not full_name:
-                full_name = f"{first or ''} {last or ''}".strip() or None
+                first = clean.get("first name") or clean.get("firstname") or clean.get("first")
+                last = clean.get("last name") or clean.get("lastname") or clean.get("last")
+                full_name = clean.get("full name") or clean.get("name")
+                if not full_name:
+                    full_name = f"{first or ''} {last or ''}".strip() or None
 
-            phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell")
-            email = clean.get("email")
-            st = clean.get("state") or clean.get("st")
-            dob = clean.get("dob") or clean.get("date of birth") or clean.get("birthdate")
-            cov_type = clean.get("policy type") or clean.get("type")
-            source = clean.get("source") or clean.get("vendor")
+                phone = clean.get("phone") or clean.get("phone number") or clean.get("mobile") or clean.get("cell")
+                email = clean.get("email")
+                state = clean.get("state") or clean.get("st")
+                dob = clean.get("dob") or clean.get("date of birth") or clean.get("birthdate")
+                coverage_type = clean.get("policy type") or clean.get("coverage type") or clean.get("type")
+                source = clean.get("vendor") or clean.get("source")
 
-        # --- CASE 2: headerless positional CSV (YOUR FILES) ---
-        elif isinstance(row, (list, tuple)) and len(row) >= 5:
-            first = (row[0] or "").strip()
-            last = (row[1] or "").strip()
-            cov_type = (row[2] or "").strip()      # IUL
-            source = (row[3] or "").strip()        # GOAT
-            phone = (row[4] or "").strip()
-            dob = (row[6] or "").strip() if len(row) > 6 else None
-            email = (row[7] or "").strip() if len(row) > 7 else None
-            st = (row[8] or "").strip() if len(row) > 8 else None
-            full_name = f"{first} {last}".strip() or None
+            # POSITIONAL CSV (YOUR FILES)
+            elif isinstance(row, (list, tuple)) and len(row) >= 5:
+                first = (row[0] or "").strip()
+                last = (row[1] or "").strip()
+                coverage_type = (row[2] or "").strip()     # IUL
+                source = (row[3] or "").strip()            # GOAT
+                phone = (row[4] or "").strip()
+                dob = (row[6] or "").strip() if len(row) > 6 else None
+                email = (row[7] or "").strip() if len(row) > 7 else None
+                state = (row[8] or "").strip() if len(row) > 8 else None
+                full_name = f"{first} {last}".strip() or None
 
-        else:
+            else:
+                continue
+
+            leads.append({
+                "full_name": full_name,
+                "phone": phone,
+                "email": email,
+                "state": state,
+                "birthdate": dob,
+                "coverage_type": coverage_type,
+                "lead_source": source,
+            })
+
+        return leads
+
+    # -------------------------
+    # TEXT (PDF / OCR)
+    # -------------------------
+    raw = str(data or "")
+    buf = {}
+    phone_re = re.compile(r"(\+?1?\s*\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})")
+    email_re = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+    def flush():
+        nonlocal buf
+        if buf.get("phone") or buf.get("email"):
+            leads.append(buf)
+        buf = {}
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            flush()
             continue
 
-        leads.append({
-            "full_name": full_name,
-            "phone": phone,
-            "email": email,
-            "state": st,
-            "birthdate": dob,
-            "coverage_type": cov_type,
-            "lead_source": source,
-        })
+        low = line.lower()
 
+        if ":" in line:
+            k, v = line.split(":", 1)
+            key = k.strip().lower()
+            val = v.strip()
+
+            if key in ["name", "full name"]:
+                buf["full_name"] = val
+            elif key in ["phone", "mobile", "cell"]:
+                buf["phone"] = val
+            elif key == "email":
+                buf["email"] = val
+            elif key in ["state", "st"]:
+                buf["state"] = val
+            elif "birth" in key or "dob" in key:
+                buf["birthdate"] = val
+            elif "coverage" in key or "policy" in key:
+                buf["coverage_type"] = val
+            elif key in ["vendor", "source"]:
+                buf["lead_source"] = val
+            continue
+
+        if m := phone_re.search(line):
+            buf["phone"] = m.group(1)
+
+        if m := email_re.search(line):
+            buf["email"] = m.group(0)
+
+        if "full_name" not in buf and len(line.split()) >= 2 and not any(c.isdigit() for c in line):
+            if len(line) <= 40:
+                buf["full_name"] = line
+
+    flush()
     return leads
 
     # Text parse (PDF / OCR / Doc)
@@ -598,113 +657,6 @@ def _safe_full_name(first: Optional[str], last: Optional[str]) -> str:
 
 
 # ---------- PDF Import Endpoint (Immediate Import) ----------
-
-@app.post("/import/pdf")
-async def import_pdf(file: UploadFile = File(...)):
-    """
-    Immediate import:
-    - Each page => one Lead
-    - Missing fields allowed
-    - All extracted fields stored (Lead + LeadMemory)
-    """
-    if not PDF_OK:
-        return JSONResponse({"ok": False, "error": "PDF support not installed (pypdf missing)."}, status_code=400)
-
-    db = SessionLocal()
-    created = 0
-    skipped = 0
-    errors = 0
-
-    try:
-        data = await file.read()
-        if not data:
-            return JSONResponse({"ok": False, "error": "Empty file"}, status_code=400)
-
-        reader = PdfReader(io.BytesIO(data))
-        total_pages = len(reader.pages)
-
-        for idx in range(total_pages):
-            try:
-                page_text = (reader.pages[idx].extract_text() or "").strip()
-                if not page_text:
-                    skipped += 1
-                    continue
-
-                parsed = _parse_one_lead_from_page(page_text)
-
-                # Normalize key fields
-                phone = normalize_phone(parsed.get("phone") or "")
-                email = clean_text(parsed.get("email") or "")
-                full_name = _safe_full_name(parsed.get("first_name"), parsed.get("last_name"))
-
-                # If the page truly has no contact info, still create a lead (your requirement),
-                # but mark it so it can be reviewed.
-                tz = infer_timezone_from_phone(phone) if phone else None
-
-                # Dedupe: only when we have enough to dedupe
-                if phone and dedupe_exists(db, phone, email):
-                    skipped += 1
-                    continue
-
-                lead = Lead(
-                    full_name=full_name,
-                    phone=phone or "UNKNOWN",   # keep row valid if phone missing
-                    email=email or None,
-                    state="NEW",
-                    timezone=tz,
-                    created_at=_now(),
-                    updated_at=_now(),
-                )
-                db.add(lead)
-                db.flush()  # get lead.id
-
-                # Store all call-critical info into memory (only if present)
-                _mem_upsert(db, lead.id, "source_type", "pdf_inquiry")
-                _mem_upsert(db, lead.id, "source_filename", clean_text(file.filename or "uploaded.pdf"))
-                _mem_upsert(db, lead.id, "pdf_page_number", str(idx + 1))
-
-                for k in [
-                    "tier", "inquiry_id", "age", "dob", "address", "city", "us_state", "zip",
-                    "county", "smoker", "height", "weight", "beneficiary", "military",
-                    "coverage_requested"
-                ]:
-                    v = parsed.get(k)
-                    if v is not None:
-                        _mem_upsert(db, lead.id, k, str(v))
-
-                # Optional: store raw page text (can be long; keep it if you want)
-                raw = parsed.get("raw_text") or ""
-                if raw:
-                    _mem_upsert(db, lead.id, "raw_pdf_text", raw[:12000])
-
-                _log(db, lead.id, None, "LEAD_IMPORTED_PDF", f"page={idx+1} name={full_name} phone={phone or '-'}")
-                created += 1
-
-            except Exception as e:
-                errors += 1
-                _log(db, None, None, "PDF_PAGE_IMPORT_ERROR", f"page={idx+1} err={str(e)[:300]}")
-
-        db.commit()
-        return {
-            "ok": True,
-            "pages": total_pages,
-            "created": created,
-            "skipped": skipped,
-            "errors": errors,
-        }
-
-    finally:
-        db.close()
-    return True
-
-def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
-    rows = (
-        db.query(LeadMemory)
-        .filter(LeadMemory.lead_id == lead_id)
-        .order_by(LeadMemory.key.asc())
-        .all()
-    )
-    return {r.key: r.value for r in rows}
     
 # =========================
 # Health / Root / Service worker
@@ -1450,43 +1402,13 @@ def imports_page():
 # =========================
 # Imports (ONE route each - no duplicates)
 # =========================
-@app.post("/import/csv")
-async def import_csv(file: UploadFile = File(...)):
-    db = SessionLocal()
-    try:
-        raw_bytes = await file.read()
-        if not raw_bytes:
-            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
-
-        raw = raw_bytes.decode("utf-8", errors="ignore")
-        reader = csv.DictReader(io.StringIO(raw))
-        rows = list(reader)
-
-        leads = normalize_to_leads(rows)
-
-        added = 0
-        for lead in leads:
-            if _import_row(db, lead):
-                added += 1
-
-        _log(db, None, None, "IMPORT_CSV", f"rows={len(rows)} leads={len(leads)} imported={added}")
-        db.commit()
-        return RedirectResponse("/dashboard", status_code=303)
-    except Exception as e:
-        _log(db, None, None, "IMPORT_CSV_ERROR", str(e)[:2000])
-        db.commit()
-        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>CSV Import Error: {str(e)[:500]}</div>", status_code=400)
-    finally:
-        db.close()
-
-
 @app.post("/import/pdf")
 async def import_pdf(file: UploadFile = File(...)):
     db = SessionLocal()
     try:
         data = await file.read()
         if not data:
-            return HTMLResponse("<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>Empty upload</div>", status_code=400)
+            return HTMLResponse("Empty upload", status_code=400)
 
         text_data = extract_text_from_pdf_bytes(data)
         if not (text_data or "").strip():
@@ -1495,6 +1417,7 @@ async def import_pdf(file: UploadFile = File(...)):
             return RedirectResponse("/dashboard", status_code=303)
 
         leads = normalize_to_leads(text_data)
+
         added = 0
         for lead in leads:
             if _import_row(db, lead):
@@ -1503,10 +1426,74 @@ async def import_pdf(file: UploadFile = File(...)):
         _log(db, None, None, "IMPORT_PDF", f"imported={added}")
         db.commit()
         return RedirectResponse("/dashboard", status_code=303)
-    except Exception as e:
-        _log(db, None, None, "IMPORT_PDF_ERROR", str(e)[:2000])
+
+    finally:
+        db.close()
+
+def get_lead_memory_dict(db: Session, lead_id: int) -> dict:
+    rows = (
+        db.query(LeadMemory)
+        .filter(LeadMemory.lead_id == lead_id)
+        .order_by(LeadMemory.key.asc())
+        .all()
+    )
+    return {r.key: r.value for r in rows}
+    
+@app.post("/import/csv")
+def import_csv(file: UploadFile = File(...)):
+    db = SessionLocal()
+    try:
+        content = file.file.read().decode("utf-8", errors="ignore")
+
+        # Try header-based first
+        reader = csv.DictReader(io.StringIO(content))
+        rows = list(reader)
+        if not rows or all(not any(r.values()) for r in rows):
+            # Fallback to positional CSV
+            rows = list(csv.reader(io.StringIO(content)))
+
+        normalized = normalize_to_leads(rows)
+
+        imported = 0
+        skipped = 0
+
+        for item in normalized:
+            phone = normalize_phone(item.get("phone"))
+            email = item.get("email")
+            if not phone:
+                skipped += 1
+                continue
+
+            if dedupe_exists(db, phone, email):
+                skipped += 1
+                continue
+
+            lead = Lead(
+                full_name=item.get("full_name") or "Unknown",
+                phone=phone,
+                email=email,
+                state="NEW",
+                timezone=infer_timezone_from_phone(phone),
+                created_at=_now(),
+                updated_at=_now(),
+            )
+            db.add(lead)
+            db.flush()
+
+            for k, v in item.items():
+                if k in ["full_name", "phone", "email"] or not v:
+                    continue
+                db.add(LeadMemory(
+                    lead_id=lead.id,
+                    key=k,
+                    value=str(v),
+                ))
+
+            imported += 1
+
+        _log(db, None, None, "CSV_IMPORTED", f"imported={imported} skipped={skipped}")
         db.commit()
-        return HTMLResponse(f"<div style='font-family:system-ui;padding:20px;color:#ffb4b4'>PDF Import Error: {str(e)[:500]}</div>", status_code=400)
+        return RedirectResponse(f"/dashboard?imported={imported}&skipped={skipped}", status_code=303)
     finally:
         db.close()
 
