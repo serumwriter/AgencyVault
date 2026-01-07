@@ -477,6 +477,7 @@ Accepts:
 # =========================
 def _import_row(db: Session, row: Dict[str, Any]) -> bool:
     phone = normalize_phone(row.get("phone"))
+    full_name = clean_text(item.get("full_name") or "")
     email = clean_text(row.get("email"))
     name = clean_text(row.get("full_name")) or "Unknown"
 
