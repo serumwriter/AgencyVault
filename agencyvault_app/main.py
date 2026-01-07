@@ -495,7 +495,7 @@ def _import_row(db: Session, row: Dict[str, Any]) -> bool:
     ref = clean_text(row.get("lead_reference"))
 
 lead = Lead(
-    full_name=name,
+    full_name=full_name or "Unknown",
     phone=phone,
     email=email,
     state="NEW",
