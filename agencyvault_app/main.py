@@ -642,6 +642,71 @@ def ai_plan():
     finally:
         db.close()
 
+def execute_pending_actions(db: Session, limit: int = 5) -> Dict[str, Any]:
+    paused = (mem_get(db, 0, "GLOBAL_PAUSE") or "0") == "1"
+    if paused:
+        return {"ok": False, "paused": True}
+
+    nowv = _now()
+    executed = 0
+    failed = 0
+
+    actions = (
+        db.query(Action)
+        .filter(Action.status == "PENDING")
+        .order_by(Action.created_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+        .all()
+    )
+
+    for action in actions:
+        try:
+            payload = json.loads(action.payload_json or "{}")
+
+            # Enforce due_at (for calls)
+            due_at = payload.get("due_at")
+            if due_at:
+                if nowv < datetime.fromisoformat(due_at):
+                    continue
+
+            # Enforce lead local hours (8am–8pm)
+            lead = db.query(Lead).filter_by(id=action.lead_id).first()
+            if not lead:
+                action.status = "FAILED"
+                action.error = "Lead missing"
+                failed += 1
+                continue
+
+            tz = ZoneInfo(lead.timezone or "UTC")
+            local_hour = nowv.astimezone(tz).hour
+            if local_hour < 8 or local_hour > 20:
+                continue
+
+            # Execute
+            if action.type == "TEXT":
+                send_lead_sms(payload["to"], payload["message"])
+
+            elif action.type == "CALL":
+                if _make_call:
+                    _make_call(payload["to"], payload.get("lead_id"))
+                else:
+                    raise RuntimeError("Call function not available")
+
+            else:
+                raise RuntimeError(f"Unknown action type {action.type}")
+
+            action.status = "DONE"
+            action.finished_at = _now()
+            executed += 1
+
+        except Exception as e:
+            action.status = "FAILED"
+            action.error = str(e)[:500]
+            failed += 1
+
+    db.commit()
+    return {"ok": True, "executed": executed, "failed": failed}
 
 # =========================
 # Assistant API
@@ -731,6 +796,14 @@ def _svg_donut(pct: float) -> str:
 # =========================
 # Dashboard
 # =========================
+@app.post("/worker/execute")
+def worker_execute(limit: int = 5):
+    db = SessionLocal()
+    try:
+        return execute_pending_actions(db, limit=limit)
+    finally:
+        db.close()
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db = SessionLocal()
