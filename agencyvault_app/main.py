@@ -494,21 +494,30 @@ def _import_row(db: Session, row: Dict[str, Any]) -> bool:
     src = clean_text(row.get("lead_source"))
     ref = clean_text(row.get("lead_reference"))
 
-    lead = Lead(
-        full_name=name,
-        phone=phone,
-        email=email,
-        state="NEW",                 # workflow state, not US state
-        timezone=tz,
-        us_state=st,                 # IMPORTANT: separate column (your models should have it; if not, we can switch to LeadMemory)
-        birthdate=birth,
-        coverage_requested=cov,
-        coverage_type=cov_type,
-        lead_source=src,
-        lead_reference=ref,
-        created_at=_now(),
-        updated_at=_now(),
-    )
+lead = Lead(
+    full_name=name,
+    phone=phone,
+    email=email,
+    state="NEW",
+    timezone=tz,
+    created_at=_now(),
+    updated_at=_now(),
+)
+db.add(lead)
+db.flush()   # VERY IMPORTANT
+# Store all extra intelligence in LeadMemory
+extras = {
+    "us_state": st,
+    "birthdate": birth,
+    "coverage_requested": cov,
+    "coverage_type": cov_type,
+    "lead_source": src,
+    "lead_reference": ref,
+}
+
+for k, v in extras.items():
+    if v:
+        _mem_upsert(db, lead.id, k, str(v))
 
     db.add(lead)
 import re
