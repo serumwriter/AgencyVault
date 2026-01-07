@@ -792,6 +792,56 @@ def ai_plan():
     finally:
         db.close()
 
+@app.get("/agenda", response_class=HTMLResponse)
+def agenda():
+    db = SessionLocal()
+    try:
+        actions = (
+            db.query(Action)
+            .filter(Action.status == "PENDING")
+            .order_by(Action.created_at.asc())
+            .limit(150)
+            .all()
+        )
+
+        rows = ""
+        for a in actions:
+            rows += f"""
+            <div style="border-bottom:1px solid #333;padding:12px 0">
+              <div><b>Action:</b> {a.type}</div>
+              <div><b>Lead ID:</b> {a.lead_id}</div>
+
+              <form method="post" action="/agenda/report" style="margin-top:8px">
+                <input type="hidden" name="action_id" value="{a.id}" />
+
+                <textarea name="note"
+                  placeholder="Paste what the lead said or write notes here"
+                  style="width:100%;min-height:60px;margin-top:6px"></textarea>
+
+                <div style="margin-top:8px">
+                  <button type="submit" name="outcome" value="talked">Talked / Replied</button>
+                  <button type="submit" name="outcome" value="no_answer">No answer</button>
+                  <button type="submit" name="outcome" value="not_interested">Not interested</button>
+                  <button type="submit" name="outcome" value="booked">Booked</button>
+                </div>
+              </form>
+            </div>
+            """
+
+        return HTMLResponse(f"""
+        <html>
+        <head>
+          <title>Agenda</title>
+        </head>
+        <body style="background:#111;color:#eee;font-family:Arial;padding:20px">
+          <h1>AI Agenda (What to do now)</h1>
+          <p>This page tells you exactly what to do. Complete items top to bottom.</p>
+          {rows if rows else "<p>No pending actions.</p>"}
+        </body>
+        </html>
+        """)
+    finally:
+        db.close()
 
 # =========================
 # Dashboard UI helpers
