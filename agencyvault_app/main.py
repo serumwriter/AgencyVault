@@ -2000,3 +2000,45 @@ async def assistant_api(payload: dict):
         return {"reply": "Try: counts | run planner | execute | lead 123 | wake rules"}
     finally:
         db.close()
+
+# =========================
+# GOOGLE CALENDAR AUTH
+# =========================
+
+from fastapi.responses import RedirectResponse
+from google_auth_oauthlib.flow import Flow
+import os
+import json
+
+@app.get("/auth/google")
+def google_auth():
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": os.environ["GOOGLE_CLIENT_ID"],
+                "client_secret": os.environ["GOOGLE_CLIENT_SECRET"],
+                "redirect_uris": [os.environ["GOOGLE_REDIRECT_URI"]],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=["https://www.googleapis.com/auth/calendar"],
+    )
+    flow.redirect_uri = os.environ["GOOGLE_REDIRECT_URI"]
+
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+
+    return RedirectResponse(auth_url)
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str):
+    # TEMP TEST RESPONSE
+    return {
+        "ok": True,
+        "received_code": bool(code)
+    }
