@@ -843,6 +843,25 @@ def agenda():
     finally:
         db.close()
 
+@app.post("/workday/start")
+def start_workday():
+    """
+    Enterprise mode:
+    - AI decides what to do
+    - Plans a full day safely
+    - Sends user straight to execution
+    """
+    db = SessionLocal()
+    try:
+        # Let AI decide the workload (enterprise default)
+        plan_actions(db, batch_size=120)
+        db.commit()
+    finally:
+        db.close()
+
+    # Send the user straight to work
+    return RedirectResponse("/agenda", status_code=303)
+
 # =========================
 # Dashboard UI helpers
 # =========================
@@ -1274,6 +1293,9 @@ def dashboard():
       Phone is mandatory. Imports + outreach are designed to not crash.
     </div>
   </aside>
+  <form method="post" action="/workday/start" style="margin:0">
+  <button class="btn" type="submit">Start My Workday</button>
+</form>
 
   <main class="main">
     <div class="topbar">
