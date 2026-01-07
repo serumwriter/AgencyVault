@@ -729,29 +729,25 @@ def _fmt_dt(s: str) -> str:
     except Exception:
         return s[:40]
 
-def _upcoming_appts(db: Session, limit: int = 8) -> List[Dict[str, str]]:
-    """
-    Appointment memory convention:
-      key="appt_time_iso" value="2026-01-06T10:30:00"
-      key="appt_tz" value="America/Chicago"
-      key="appt_note" value="..."
-    """
-    # Simple scan: take newest leads and show if they have appt_time_iso
-    leads = db.query(Lead).order_by(Lead.updated_at.desc()).limit(200).all()
+def _upcoming_appts(db, limit=10):
+    rows = (
+        db.query(Action)
+        .filter(Action.kind == "APPOINTMENT")
+        .order_by(Action.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
     out = []
-    for l in leads:
-        t = mem_get(db, l.id, "appt_time_iso")
-        if not t:
-            continue
+    for r in rows:
+        payload = r.payload or {}
         out.append({
-            "lead_id": str(l.id),
-            "name": l.full_name or "Unknown",
-            "when": _fmt_dt(t),
-            "tz": mem_get(db, l.id, "appt_tz") or (l.timezone or ""),
-            "note": (mem_get(db, l.id, "appt_note") or "")[:80],
+            "lead_id": r.lead_id or 0,
+            "name": payload.get("name") or "Appointment",
+            "when": payload.get("when") or "Unknown time",
+            "tz": payload.get("tz") or "local",
+            "note": payload.get("note") or "",
         })
-        if len(out) >= limit:
-            break
     return out
 
 
