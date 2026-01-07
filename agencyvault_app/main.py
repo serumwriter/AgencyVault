@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo
 
 from .database import engine, SessionLocal
-from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message
+from .models import Base, Lead, Action, AgentRun, LeadMemory, AuditLog, Message, Task
 
 # Optional Google imports (if you already have google_drive_import.py)
 try:
